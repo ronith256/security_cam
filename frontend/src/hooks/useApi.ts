@@ -1,5 +1,5 @@
 // src/hooks/useApi.ts
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useRef } from 'react';
 import { useToast } from '../context/ToastContext';
 import axios, { AxiosError } from 'axios';
 
@@ -20,14 +20,10 @@ export function useApi<T>(
   const [error, setError] = useState<Error | AxiosError | null>(null);
   const { showToast } = useToast();
   
-  const {
-    onSuccess,
-    onError,
-    showSuccessToast = false,
-    showErrorToast = true,
-    successMessage,
-  } = options;
-
+  // Store options in refs to prevent them from causing re-renders
+  const optionsRef = useRef(options);
+  optionsRef.current = options; // Update ref on each render
+  
   const execute = useCallback(
     async (...args: any[]) => {
       setIsLoading(true);
@@ -37,12 +33,12 @@ export function useApi<T>(
         const result = await apiFunction(...args);
         setData(result);
         
-        if (onSuccess) {
-          onSuccess(result);
+        if (optionsRef.current.onSuccess) {
+          optionsRef.current.onSuccess(result);
         }
         
-        if (showSuccessToast) {
-          showToast(successMessage || 'Operation successful', 'success');
+        if (optionsRef.current.showSuccessToast) {
+          showToast(optionsRef.current.successMessage || 'Operation successful', 'success');
         }
         
         return result;
@@ -50,11 +46,11 @@ export function useApi<T>(
         const error = err as Error | AxiosError;
         setError(error);
         
-        if (onError) {
-          onError(error);
+        if (optionsRef.current.onError) {
+          optionsRef.current.onError(error);
         }
         
-        if (showErrorToast) {
+        if (optionsRef.current.showErrorToast) {
           let errorMessage = 'An error occurred';
           
           if (axios.isAxiosError(error) && error.response?.data?.detail) {
@@ -71,7 +67,7 @@ export function useApi<T>(
         setIsLoading(false);
       }
     },
-    [apiFunction, onSuccess, onError, showSuccessToast, showErrorToast, successMessage, showToast]
+    [apiFunction, showToast] // Only depend on stable dependencies
   );
 
   return {

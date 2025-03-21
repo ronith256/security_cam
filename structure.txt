@@ -1,0 +1,76 @@
+├── public/
+│   ├── favicon.ico
+│   └── index.html
+├── src/
+│   ├── api/
+│   │   ├── index.ts                   # API client setup
+│   │   ├── cameras.ts                 # Camera API calls
+│   │   ├── templates.ts               # Template API calls
+│   │   ├── peopleCount.ts             # People counting API calls
+│   │   ├── faceRecognition.ts         # Face recognition API calls
+│   │   └── settings.ts                # Settings API calls
+│   ├── components/
+│   │   ├── common/
+│   │   │   ├── Navbar.tsx             # Navigation bar
+│   │   │   ├── Sidebar.tsx            # Sidebar menu
+│   │   │   ├── PageHeader.tsx         # Page headers
+│   │   │   ├── Button.tsx             # Button component
+│   │   │   ├── Card.tsx               # Card component
+│   │   │   ├── Modal.tsx              # Modal component
+│   │   │   ├── Loader.tsx             # Loading spinner
+│   │   │   └── Toast.tsx              # Toast notifications
+│   │   ├── cameras/
+│   │   │   ├── CameraList.tsx         # List of cameras
+│   │   │   ├── CameraCard.tsx         # Camera preview card
+│   │   │   ├── CameraForm.tsx         # Add/edit camera form
+│   │   │   ├── CameraStream.tsx       # Camera video stream
+│   │   │   ├── CameraSettings.tsx     # Camera settings form
+│   │   │   └── CameraStats.tsx        # Camera statistics
+│   │   ├── templates/
+│   │   │   ├── TemplateList.tsx       # List of templates
+│   │   │   ├── TemplateCard.tsx       # Template preview card
+│   │   │   ├── TemplateForm.tsx       # Add/edit template form
+│   │   │   └── TemplateMatches.tsx    # Template match results
+│   │   ├── people/
+│   │   │   ├── PeopleCounter.tsx      # People counter component
+│   │   │   ├── OccupancyChart.tsx     # Occupancy visualization
+│   │   │   └── TrafficStats.tsx       # Entry/exit statistics
+│   │   ├── faces/
+│   │   │   ├── PersonList.tsx         # List of registered persons
+│   │   │   ├── PersonCard.tsx         # Person card with details
+│   │   │   ├── PersonForm.tsx         # Register person form
+│   │   │   ├── FaceDetections.tsx     # Current face detections
+│   │   │   └── PersonStats.tsx        # Person statistics
+│   │   └── settings/
+│   │       ├── GlobalSettings.tsx     # Global settings form
+│   │       └── SettingsCard.tsx       # Settings card component
+│   ├── context/
+│   │   ├── AuthContext.tsx            # Authentication context
+│   │   └── ToastContext.tsx           # Toast notifications context
+│   ├── hooks/
+│   │   ├── useApi.ts                  # API hook with loading/error states
+│   │   ├── useInterval.ts             # Interval hook for polling
+│   │   └── useCamera.ts               # Camera-specific hook
+│   ├── pages/
+│   │   ├── Dashboard.tsx              # Main dashboard page
+│   │   ├── Cameras.tsx                # Camera management page
+│   │   ├── CameraDetail.tsx           # Single camera page
+│   │   ├── Templates.tsx              # Template management page
+│   │   ├── PeopleCount.tsx            # People counting page
+│   │   ├── FaceRecognition.tsx        # Face recognition page
+│   │   ├── Settings.tsx               # Settings page
+│   │   └── NotFound.tsx               # 404 page
+│   ├── types/
+│   │   ├── camera.ts                  # Camera types
+│   │   ├── template.ts                # Template types
+│   │   ├── person.ts                  # Person types
+│   │   ├── event.ts                   # Event types
+│   │   └── settings.ts                # Settings types
+│   ├── utils/
+│   │   ├── date.ts                    # Date formatting utilities
+│   │   ├── formatters.ts              # Data formatters
+│   │   └── validation.ts              # Form validation utilities
+│   ├── App.tsx                        # Main App component
+│   ├── index.tsx                      # Entry point
+│   ├── routes.tsx                     # Application routes
+│   └── index.css                      # Global styles

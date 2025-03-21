@@ -1,5 +1,5 @@
 // src/components/cameras/CameraList.tsx
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { Camera as CameraType } from '../../types/camera';
 import CameraCard from './CameraCard';
 import Loader from '../common/Loader';
@@ -13,6 +13,7 @@ interface CameraListProps {
 
 const CameraList: React.FC<CameraListProps> = ({ filter }) => {
   const [cameras, setCameras] = useState<CameraType[]>([]);
+  const isFirstRender = useRef(true);
   
   const { execute: loadCameras, isLoading, error } = useApi(fetchCameras, {
     onSuccess: (data) => {
@@ -21,7 +22,10 @@ const CameraList: React.FC<CameraListProps> = ({ filter }) => {
   });
 
   useEffect(() => {
-    loadCameras();
+    if (isFirstRender.current) {
+      loadCameras();
+      isFirstRender.current = false;
+    }
   }, [loadCameras]);
 
   const handleDelete = (id: number) => {

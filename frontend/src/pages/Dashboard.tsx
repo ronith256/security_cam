@@ -1,20 +1,20 @@
 // src/pages/Dashboard.tsx
-import React, { useState, useEffect } from 'react';
-import { Plus, ArrowRight, Camera, Users, UserPlus } from 'lucide-react';
-import { Link } from 'react-router-dom';
-import PageHeader from '../components/common/PageHeader';
-import Card from '../components/common/Card';
-import Button from '../components/common/Button';
-import CameraList from '../components/cameras/CameraList';
-import { fetchCameras } from '../api/cameras';
-import { getCurrentOccupancy } from '../api/peopleCount';
-import { useApi } from '../hooks/useApi';
+import React, { useState, useEffect } from "react";
+import { Plus, ArrowRight, Camera, Users, UserPlus } from "lucide-react";
+import { Link } from "react-router-dom";
+import PageHeader from "../components/common/PageHeader";
+import Card from "../components/common/Card";
+import Button from "../components/common/Button";
+import CameraList from "../components/cameras/CameraList";
+import { fetchCameras } from "../api/cameras";
+import { getCurrentOccupancy } from "../api/peopleCount";
+import { useApi } from "../hooks/useApi";
 
 const Dashboard: React.FC = () => {
   const [totalOccupancy, setTotalOccupancy] = useState(0);
-  
+
   const { execute: loadCameras, data: cameras } = useApi(fetchCameras);
-  
+
   const { execute: loadOccupancy } = useApi(getCurrentOccupancy, {
     onSuccess: (data) => {
       const total = data.reduce((sum, item) => sum + item.current_count, 0);
@@ -23,17 +23,20 @@ const Dashboard: React.FC = () => {
   });
 
   useEffect(() => {
+    // Load data initially
     loadCameras();
     loadOccupancy();
-    
+
+    // Set up interval for periodic updates
     const interval = setInterval(() => {
       loadOccupancy();
-    }, 60000); // Update occupancy every minute
-    
-    return () => clearInterval(interval);
-  }, [loadCameras, loadOccupancy]);
+    }, 60000); // Update occupancy once per minute, not continuously
 
-  const activeCameras = cameras?.filter(camera => camera.enabled)?.length || 0;
+    return () => clearInterval(interval);
+  }, []);
+
+  const activeCameras =
+    cameras?.filter((camera) => camera.enabled)?.length || 0;
   const totalCameras = cameras?.length || 0;
 
   return (
@@ -51,14 +54,16 @@ const Dashboard: React.FC = () => {
             </div>
             <div>
               <h3 className="text-xl font-bold">Cameras</h3>
-              <p className="text-3xl font-bold">{activeCameras} / {totalCameras}</p>
+              <p className="text-3xl font-bold">
+                {activeCameras} / {totalCameras}
+              </p>
               <p className="text-sm opacity-80">Active Cameras</p>
             </div>
           </div>
           <div className="mt-6">
             <Link to="/cameras">
-              <Button 
-                variant="secondary" 
+              <Button
+                variant="secondary"
                 className="bg-white bg-opacity-20 hover:bg-opacity-30 text-white border-none"
                 icon={<ArrowRight size={16} />}
               >
@@ -81,8 +86,8 @@ const Dashboard: React.FC = () => {
           </div>
           <div className="mt-6">
             <Link to="/people-count">
-              <Button 
-                variant="secondary" 
+              <Button
+                variant="secondary"
                 className="bg-white bg-opacity-20 hover:bg-opacity-30 text-white border-none"
                 icon={<ArrowRight size={16} />}
               >
@@ -99,13 +104,15 @@ const Dashboard: React.FC = () => {
             </div>
             <div>
               <h3 className="text-xl font-bold">Face Recognition</h3>
-              <p className="text-sm opacity-80 mt-2">Register and track people by face</p>
+              <p className="text-sm opacity-80 mt-2">
+                Register and track people by face
+              </p>
             </div>
           </div>
           <div className="mt-6">
             <Link to="/face-recognition">
-              <Button 
-                variant="secondary" 
+              <Button
+                variant="secondary"
                 className="bg-white bg-opacity-20 hover:bg-opacity-30 text-white border-none"
                 icon={<ArrowRight size={16} />}
               >

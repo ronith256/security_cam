@@ -8,7 +8,8 @@ from app.api import cameras, templates, people_counting, face_recognition, setti
 app = FastAPI(
     title="CCTV Monitoring System",
     description="API for CCTV monitoring with AI capabilities",
-    version="1.0.0"
+    version="1.0.0",
+    docs_url="/docs"
 )
 
 # Configure CORS
