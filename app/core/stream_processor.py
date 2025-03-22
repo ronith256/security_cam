@@ -37,6 +37,9 @@ class StreamProcessor:
         self.recognize_faces = recognize_faces
         self.template_matching = template_matching
         
+        # Processing control flag
+        self.should_process = detect_people or count_people or recognize_faces or template_matching
+        
         # Video capture object
         self.cap = None
         self.connected = False
@@ -47,6 +50,12 @@ class StreamProcessor:
         self.latest_processed_frame = None
         self.last_frame_time = 0
         self.last_processed_time = 0
+        
+        # Template matching for scene change detection
+        self.base_template = None
+        self.last_template_update = 0
+        self.change_threshold = 0.10  # 10% change threshold for processing
+        self.template_update_interval = 3600  # Update template every hour
         
         # AI components (will be initialized lazily)
         self.object_detector = None
@@ -89,6 +98,10 @@ class StreamProcessor:
                 
             logger.info(f"Successfully read test frame from {self.rtsp_url}, dimensions: {test_frame.shape}")
             
+            # Store first frame as template if none exists
+            if self.base_template is None:
+                self.set_base_template(test_frame)
+            
             # Set buffer size to reduce latency
             self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             
@@ -129,6 +142,39 @@ class StreamProcessor:
         
         logger.info(f"Disconnected from camera {self.camera_id}")
     
+    def set_base_template(self, frame: np.ndarray):
+        """Set the base template for scene change detection"""
+        # Convert to grayscale and resize for faster comparison
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        resized = cv2.resize(gray, (320, 240))  # Lower resolution for comparison
+        self.base_template = resized
+        self.last_template_update = time.time()
+        logger.info(f"Updated base template for camera {self.camera_id}")
+    
+    def scene_has_changed(self, frame: np.ndarray) -> bool:
+        """Detect if the scene has changed significantly from base template"""
+        if self.base_template is None:
+            # If no template, always process
+            return True
+        
+        # Check if it's time to update the template
+        if time.time() - self.last_template_update > self.template_update_interval:
+            self.set_base_template(frame)
+            return True
+        
+        # Convert to grayscale and resize to match template
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        resized = cv2.resize(gray, (320, 240))
+        
+        # Calculate Mean Absolute Difference (MAD)
+        diff = cv2.absdiff(resized, self.base_template)
+        mean_diff = np.mean(diff) / 255.0  # Normalize to 0-1 range
+        
+        # If difference exceeds threshold, scene has changed
+        changed = mean_diff > self.change_threshold
+        
+        return changed
+    
     async def process_stream(self):
         """Main processing loop for the video stream"""
         if not self.connected or not self.cap:
@@ -138,7 +184,9 @@ class StreamProcessor:
         self.processing = True
         loop = asyncio.get_event_loop()
         frames_processed = 0
+        frames_skipped = 0
         processing_start_time = time.time()
+        last_process_time = 0
         
         try:
             logger.info(f"Starting stream processing for camera {self.camera_id}")
@@ -157,26 +205,54 @@ class StreamProcessor:
                     await asyncio.sleep(1)  # Wait before trying again
                     continue
                 
-                frames_processed += 1
-                if frames_processed % 100 == 0:
-                    elapsed = time.time() - processing_start_time
-                    logger.info(f"Camera {self.camera_id}: Processed {frames_processed} frames in {elapsed:.2f}s ({frames_processed/elapsed:.2f} FPS)")
-                
                 # Update the latest frame
                 async with self.frame_lock:
                     self.latest_frame = frame.copy()
                     self.last_frame_time = time.time()
                 
-                # Process frame if enough time has elapsed since the last processing
-                time_since_process = time.time() - self.last_processed_time
-                if time_since_process >= (1.0 / self.processing_fps):
-                    # Process the frame with AI models
-                    processed_frame = await self.process_frame(frame)
+                # Calculate time since last processing
+                time_since_process = time.time() - last_process_time
+                
+                # Process the frame if:
+                # 1. Enough time has elapsed since last processing (based on FPS)
+                # 2. The scene has changed significantly or we're forcing processing
+                should_process = time_since_process >= (1.0 / self.processing_fps)
+                
+                if should_process and self.should_process:
+                    # Check if scene has changed before heavy processing
+                    scene_changed = self.scene_has_changed(frame)
                     
-                    # Update the latest processed frame
-                    async with self.frame_lock:
-                        self.latest_processed_frame = processed_frame
-                        self.last_processed_time = time.time()
+                    if scene_changed:
+                        # Process the frame with AI models
+                        processed_frame = await self.process_frame(frame)
+                        
+                        # Update the latest processed frame
+                        async with self.frame_lock:
+                            self.latest_processed_frame = processed_frame
+                            self.last_processed_time = time.time()
+                            last_process_time = time.time()
+                        
+                        frames_processed += 1
+                    else:
+                        # Only update the latest processed frame with minimal overlay
+                        # (showing stats but not running AI processing)
+                        minimal_processed = frame.copy()
+                        
+                        # Add stats overlay
+                        cv2.putText(
+                            minimal_processed,
+                            f"FPS: {self.fps:.1f} (No Motion)",
+                            (10, minimal_processed.shape[0] - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.5,
+                            (255, 255, 255),
+                            1
+                        )
+                        
+                        async with self.frame_lock:
+                            self.latest_processed_frame = minimal_processed
+                        
+                        frames_skipped += 1
                 
                 # Calculate FPS
                 self.frame_count += 1
@@ -185,6 +261,15 @@ class StreamProcessor:
                     logger.debug(f"Camera {self.camera_id} processing FPS: {self.fps:.2f}")
                     self.frame_count = 0
                     self.last_fps_update = time.time()
+                
+                # Log stats every 100 frames
+                if (frames_processed + frames_skipped) % 100 == 0:
+                    elapsed = time.time() - processing_start_time
+                    logger.info(
+                        f"Camera {self.camera_id}: Processed {frames_processed} frames, "
+                        f"skipped {frames_skipped} frames in {elapsed:.2f}s "
+                        f"({(frames_processed + frames_skipped)/elapsed:.2f} FPS)"
+                    )
                 
                 # Sleep to maintain target FPS if needed
                 process_time = time.time() - process_start
@@ -260,7 +345,7 @@ class StreamProcessor:
             
             # Apply face recognition
             if self.recognize_faces and self.face_recognizer:
-                face_detections = await self.face_recognizer.recognize_faces(frame)
+                face_detections = await self.face_recognizer.recognize_faces(frame, self.camera_id)
                 detection_results['faces'] = face_detections
                 
                 # Draw faces on the frame
@@ -316,10 +401,11 @@ class StreamProcessor:
                         2
                     )
             
-            # Add stats overlay
+            # Add processing status overlay
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             cv2.putText(
                 processed_frame,
-                f"FPS: {self.fps:.1f}",
+                f"FPS: {self.fps:.1f} | {now}",
                 (10, processed_frame.shape[0] - 10),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.5,

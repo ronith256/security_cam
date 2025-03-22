@@ -1,4 +1,4 @@
-// src/components/cameras/CameraList.tsx
+// frontend/src/components/cameras/CameraList.tsx
 import React, { useState, useEffect, useRef } from 'react';
 import { Camera as CameraType } from '../../types/camera';
 import CameraCard from './CameraCard';
@@ -9,10 +9,15 @@ import { AlertCircle } from 'lucide-react';
 
 interface CameraListProps {
   filter?: (camera: CameraType) => boolean;
+  onActiveChange?: (count: number) => void;
 }
 
-const CameraList: React.FC<CameraListProps> = ({ filter }) => {
+const CameraList: React.FC<CameraListProps> = ({ 
+  filter,
+  onActiveChange 
+}) => {
   const [cameras, setCameras] = useState<CameraType[]>([]);
+  const [activeCameras, setActiveCameras] = useState<Set<number>>(new Set());
   const isFirstRender = useRef(true);
   
   const { execute: loadCameras, isLoading, error } = useApi(fetchCameras, {
@@ -28,8 +33,22 @@ const CameraList: React.FC<CameraListProps> = ({ filter }) => {
     }
   }, [loadCameras]);
 
+  // Notify parent component when active camera count changes
+  useEffect(() => {
+    if (onActiveChange) {
+      onActiveChange(activeCameras.size);
+    }
+  }, [activeCameras, onActiveChange]);
+
   const handleDelete = (id: number) => {
     setCameras((prevCameras) => prevCameras.filter((camera) => camera.id !== id));
+    
+    // Remove from active cameras if present
+    if (activeCameras.has(id)) {
+      const newActiveCameras = new Set(activeCameras);
+      newActiveCameras.delete(id);
+      setActiveCameras(newActiveCameras);
+    }
   };
 
   const handleUpdate = (updatedCamera: CameraType) => {
@@ -38,6 +57,18 @@ const CameraList: React.FC<CameraListProps> = ({ filter }) => {
         camera.id === updatedCamera.id ? updatedCamera : camera
       )
     );
+  };
+  
+  const handleCameraConnectionChange = (id: number, isConnected: boolean) => {
+    setActiveCameras(prev => {
+      const newSet = new Set(prev);
+      if (isConnected) {
+        newSet.add(id);
+      } else {
+        newSet.delete(id);
+      }
+      return newSet;
+    });
   };
 
   // Apply filter if provided
@@ -75,6 +106,7 @@ const CameraList: React.FC<CameraListProps> = ({ filter }) => {
           camera={camera}
           onDelete={handleDelete}
           onUpdate={handleUpdate}
+          onConnectionChange={(isConnected) => handleCameraConnectionChange(camera.id, isConnected)}
         />
       ))}
     </div>

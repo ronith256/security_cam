@@ -1,7 +1,7 @@
-// src/pages/CameraDetail.tsx
+// frontend/src/pages/CameraDetail.tsx
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { useParams, Link } from 'react-router-dom';
-import { Edit, ArrowLeft, Image } from 'lucide-react';
+import { Edit, ArrowLeft, Image, Activity } from 'lucide-react';
 import PageHeader from '../components/common/PageHeader';
 import Button from '../components/common/Button';
 import Card from '../components/common/Card';
@@ -67,7 +67,7 @@ const CameraDetail: React.FC = () => {
     }
   );
 
-  // Function to handle WebRTC connection state
+  // Function to handle stream connection state
   const handleStreamConnection = useCallback((active: boolean) => {
     console.log(`Stream connection state changed: ${active ? 'connected' : 'disconnected'}`);
     
@@ -190,12 +190,23 @@ const CameraDetail: React.FC = () => {
             title="Live View"
             subtitle={camera.rtsp_url}
             className="h-full flex flex-col"
+            actions={
+              <Button
+                variant="secondary"
+                size="sm"
+                icon={<Activity size={16} />}
+                onClick={() => showToast('Live feed is using high-quality WebRTC streaming', 'info')}
+              >
+                High Quality
+              </Button>
+            }
           >
             <div className="flex-grow">
               <WebRTCStream 
                 cameraId={cameraId} 
                 height="h-96" 
-                onConnectionChange={handleStreamConnection} 
+                onConnectionChange={handleStreamConnection}
+                highQuality={true} // Force high-quality WebRTC in detailed view
               />
             </div>
           </Card>
