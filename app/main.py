@@ -4,6 +4,7 @@ from fastapi.staticfiles import StaticFiles
 from app.config import settings
 from app.database import init_db
 from app.api import cameras, templates, people_counting, face_recognition, settings as app_settings
+from app.api.webrtc import router as webrtc_router, start_webrtc_streaming
 
 app = FastAPI(
     title="CCTV Monitoring System",
@@ -27,6 +28,7 @@ app.include_router(templates.router, prefix="/api/templates", tags=["templates"]
 app.include_router(people_counting.router, prefix="/api/people", tags=["people-counting"])
 app.include_router(face_recognition.router, prefix="/api/faces", tags=["face-recognition"])
 app.include_router(app_settings.router, prefix="/api/settings", tags=["settings"])
+app.include_router(webrtc_router, prefix="/api/webrtc", tags=["webrtc"])
 
 # Mount static files for storing images, templates, etc.
 app.mount("/static", StaticFiles(directory="static"), name="static")
@@ -43,6 +45,9 @@ async def startup_event():
     # Load AI models
     from app.utils.model_loader import load_models
     await load_models()
+    
+    # Start WebRTC streaming for all active cameras
+    await start_webrtc_streaming()
 
 @app.on_event("shutdown")
 async def shutdown_event():

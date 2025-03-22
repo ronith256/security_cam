@@ -5,7 +5,7 @@ import { Edit, ArrowLeft, Image, UserPlus } from 'lucide-react';
 import PageHeader from '../components/common/PageHeader';
 import Button from '../components/common/Button';
 import Card from '../components/common/Card';
-import CameraStream from '../components/cameras/CameraStream';
+import WebRTCStream from '../components/cameras/WebRTCStream';
 import CameraStats from '../components/cameras/CameraStats';
 import FaceDetections from '../components/faces/FaceDetections';
 import TemplateList from '../components/templates/TemplateList';
@@ -144,7 +144,7 @@ const CameraDetail: React.FC = () => {
             className="h-full flex flex-col"
           >
             <div className="flex-grow">
-              <CameraStream cameraId={cameraId} height="h-96" />
+              <WebRTCStream cameraId={cameraId} height="h-96" />
             </div>
           </Card>
         </div>
