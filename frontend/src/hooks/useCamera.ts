@@ -1,67 +1,107 @@
 // src/hooks/useCamera.ts
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { getCameraStatus, getCameraSnapshot } from '../api/cameras';
+import { getCameraStatus } from '../api/cameras';
 import { CameraStatus } from '../types/camera';
-import { useInterval } from './useInterval';
 
 interface UseCameraOptions {
   pollInterval?: number;
   autoStart?: boolean;
+  onStatusChange?: (status: CameraStatus | null) => void;
 }
 
 export function useCamera(cameraId: number, options: UseCameraOptions = {}) {
-  const { pollInterval = 1000, autoStart = true } = options;
+  const { 
+    pollInterval = 5000,  // Reduced polling frequency to 5 seconds
+    autoStart = true,
+    onStatusChange
+  } = options;
 
   const [status, setStatus] = useState<CameraStatus | null>(null);
-  const [snapshot, setSnapshot] = useState<string | null>(null);
   const [isPolling, setIsPolling] = useState(autoStart);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<Error | null>(null);
+  
+  // Tracking when component is mounted
+  const isMounted = useRef(true);
+  
+  // Track last fetch time to prevent excessive fetching
+  const lastFetchTime = useRef(0);
+  
+  // Track polling timers
+  const pollingTimer = useRef<number | null>(null);
 
-  const fetchStatus = useCallback(async () => {
-    if (!isPolling) return;
-
-    try {
+  const fetchStatus = useCallback(async (force = false) => {
+    // Don't fetch if not polling and not forced
+    if (!isPolling && !force) return;
+    
+    // Don't fetch too frequently unless forced
+    const now = Date.now();
+    if (!force && now - lastFetchTime.current < pollInterval) {
+      return;
+    }
+    
+    // Set loading only if we don't have data yet
+    if (!status) {
       setIsLoading(true);
+    }
+    
+    try {
+      lastFetchTime.current = now;
+      const newStatus = await getCameraStatus(cameraId);
+      
+      if (!isMounted.current) return;
+      
+      setStatus(newStatus);
       setError(null);
-
-      const status = await getCameraStatus(cameraId);
-      setStatus(status);
-
-      if (status.active) {
-        const snapshotBlob = await getCameraSnapshot(cameraId);
-        const snapshotUrl = URL.createObjectURL(snapshotBlob);
-
-        // Cleanup old snapshot URL before setting new one
-        if (snapshot) {
-          URL.revokeObjectURL(snapshot);
-        }
-
-        setSnapshot(snapshotUrl);
+      
+      if (onStatusChange) {
+        onStatusChange(newStatus);
       }
     } catch (err) {
-      setError(err as Error);
+      if (!isMounted.current) return;
+      
+      const error = err as Error;
+      setError(error);
+      console.error("Error fetching camera status:", error);
     } finally {
-      setIsLoading(false);
+      if (isMounted.current) {
+        setIsLoading(false);
+      }
     }
-  }, [cameraId, isPolling, snapshot]);
+  }, [cameraId, isPolling, status, pollInterval, onStatusChange]);
 
-  // Initial fetch - with a proper ref to prevent infinite loop
-  const initialFetchRef = useRef(autoStart);
-
+  // Setup polling
   useEffect(() => {
-    if (initialFetchRef.current) {
-      fetchStatus();
-      initialFetchRef.current = false;
+    if (isPolling) {
+      // Initial fetch
+      fetchStatus(true);
+      
+      // Set up interval for subsequent fetches
+      const intervalId = window.setInterval(() => {
+        fetchStatus();
+      }, pollInterval);
+      
+      pollingTimer.current = intervalId;
+      
+      return () => {
+        window.clearInterval(intervalId);
+        pollingTimer.current = null;
+      };
+    } else if (pollingTimer.current !== null) {
+      window.clearInterval(pollingTimer.current);
+      pollingTimer.current = null;
     }
+  }, [fetchStatus, isPolling, pollInterval]);
 
-    // Clean up any object URLs when unmounting
+  // Handle cleanup
+  useEffect(() => {
     return () => {
-      if (snapshot) {
-        URL.revokeObjectURL(snapshot);
+      isMounted.current = false;
+      if (pollingTimer.current !== null) {
+        window.clearInterval(pollingTimer.current);
       }
     };
-  }, [fetchStatus]);
+  }, []);
 
   const startPolling = useCallback(() => {
     setIsPolling(true);
@@ -71,30 +111,13 @@ export function useCamera(cameraId: number, options: UseCameraOptions = {}) {
     setIsPolling(false);
   }, []);
 
-  // Initial fetch
-  useEffect(() => {
-    if (autoStart) {
-      fetchStatus();
-    }
-    // Clean up any object URLs when unmounting
-    return () => {
-      if (snapshot) {
-        URL.revokeObjectURL(snapshot);
-      }
-    };
-  }, [autoStart, fetchStatus, snapshot]);
-
-  // Set up polling
-  useInterval(fetchStatus, isPolling ? pollInterval : null);
-
   return {
     status,
-    snapshot,
     isLoading,
     error,
+    isPolling,
     startPolling,
     stopPolling,
-    isPolling,
-    refresh: fetchStatus,
+    refresh: () => fetchStatus(true),
   };
 }

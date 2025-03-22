@@ -4,7 +4,7 @@ from fastapi.staticfiles import StaticFiles
 from app.config import settings
 from app.database import init_db
 from app.api import cameras, templates, people_counting, face_recognition, settings as app_settings
-from app.api.webrtc import router as webrtc_router, start_webrtc_streaming
+from app.api.webrtc import router as webrtc_router
 
 app = FastAPI(
     title="CCTV Monitoring System",
@@ -35,9 +35,10 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 
 @app.on_event("startup")
 async def startup_event():
-    """Initialize database and load AI models on startup"""
+    """Initialize database and essential services on startup"""
     await init_db()
-    # Initialize camera manager
+    
+    # Initialize camera manager (but don't connect to any cameras yet)
     from app.core.camera_manager import get_camera_manager
     camera_manager = await get_camera_manager()
     await camera_manager.initialize()
@@ -46,8 +47,7 @@ async def startup_event():
     from app.utils.model_loader import load_models
     await load_models()
     
-    # Start WebRTC streaming for all active cameras
-    await start_webrtc_streaming()
+    # Don't start WebRTC streaming for all cameras - only connect on demand
 
 @app.on_event("shutdown")
 async def shutdown_event():

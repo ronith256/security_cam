@@ -1,16 +1,20 @@
 // src/components/cameras/WebRTCStream.tsx
-import React, { useEffect, useRef, useState } from 'react';
-import { RefreshCw, AlertTriangle, Film, Image } from 'lucide-react';
+import React, { useEffect, useRef, useState, useCallback } from 'react';
+import { RefreshCw, AlertTriangle, Film } from 'lucide-react';
 import Button from '../common/Button';
 import Loader from '../common/Loader';
 import { getCameraSnapshot } from '../../api/cameras';
-import api from '../../api';
+
+interface WebSocketWithPing extends WebSocket {
+  pingInterval?: NodeJS.Timeout;
+}
 
 interface WebRTCStreamProps {
   cameraId: number;
   showControls?: boolean;
   height?: string;
   width?: string;
+  onConnectionChange?: (connected: boolean) => void;
 }
 
 const WebRTCStream: React.FC<WebRTCStreamProps> = ({
@@ -18,113 +22,70 @@ const WebRTCStream: React.FC<WebRTCStreamProps> = ({
   showControls = true,
   height = 'h-72',
   width = 'w-full',
+  onConnectionChange,
 }) => {
   const [isConnected, setIsConnected] = useState<boolean>(false);
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [error, setError] = useState<Error | null>(null);
-  const [streamMode, setStreamMode] = useState<'webrtc' | 'snapshot'>('webrtc');
   const [snapshot, setSnapshot] = useState<string | null>(null);
   
-  const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const wsRef = useRef<WebSocket | null>(null);
+  const wsRef = useRef<WebSocketWithPing | null>(null);
+  const connectionAttemptRef = useRef<number>(0);
+  const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   
-  // For cleanup
-  const isComponentMounted = useRef(true);
+  // To track component mount state
+  const isMounted = useRef(true);
+  
+  // Track if connection change callback has been called
+  const connectionNotifiedRef = useRef<boolean | null>(null);
 
-  // Connect to WebRTC stream
-  useEffect(() => {
-    if (streamMode !== 'webrtc') return;
+  // Function to notify parent about connection change
+  const notifyConnectionChange = useCallback((connected: boolean) => {
+    // Only notify if the state has changed or not been set yet
+    if (connectionNotifiedRef.current !== connected && onConnectionChange) {
+      connectionNotifiedRef.current = connected;
+      onConnectionChange(connected);
+    }
+  }, [onConnectionChange]);
 
-    const connect = async () => {
-      try {
-        setIsLoading(true);
-        setError(null);
-        
-        // Check if the camera is active before attempting to connect
-        try {
-          const response = await api.get(`/cameras/${cameraId}/status`);
-          if (!response.data.active) {
-            throw new Error('Camera is not active');
-          }
-        } catch (err) {
-          setError(new Error('Camera is not available'));
-          setIsLoading(false);
-          return;
-        }
-        
-        // Create WebSocket connection for signaling
-        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const wsUrl = `${protocol}//${window.location.host}/api/webrtc/ws/${cameraId}`;
-        
-        const ws = new WebSocket(wsUrl);
-        wsRef.current = ws;
-        
-        ws.onopen = () => {
-          console.log(`WebSocket connected for camera ${cameraId}`);
-        };
-        
-        ws.onmessage = (event) => {
-          const message = JSON.parse(event.data);
-          
-          if (message.type === 'frame') {
-            // Handle incoming frame (base64 encoded JPEG)
-            renderFrame(message.data);
-          } else if (message.type === 'signal') {
-            // Handle signaling messages if we implement peer-to-peer WebRTC
-            // This would be used for implementing full WebRTC with ICE, SDP, etc.
-            console.log('Received signaling message:', message.data);
-          }
-        };
-        
-        ws.onerror = (error) => {
-          console.error('WebSocket error:', error);
-          setError(new Error('Failed to connect to video stream'));
-          setIsConnected(false);
-          setIsLoading(false);
-        };
-        
-        ws.onclose = () => {
-          console.log('WebSocket closed');
-          if (isComponentMounted.current) {
-            setIsConnected(false);
-            setIsLoading(false);
-          }
-        };
-        
-        setIsConnected(true);
-        setIsLoading(false);
-      } catch (err) {
-        console.error('Error setting up WebRTC:', err);
-        setError(err instanceof Error ? err : new Error('Failed to connect to video stream'));
-        setIsLoading(false);
-      }
-    };
-
-    connect();
+  // Clean up resources
+  const cleanupResources = useCallback(() => {
+    // Clear any reconnect timeouts
+    if (reconnectTimeoutRef.current) {
+      clearTimeout(reconnectTimeoutRef.current);
+      reconnectTimeoutRef.current = null;
+    }
     
-    // Cleanup function
-    return () => {
-      if (wsRef.current) {
-        wsRef.current.close();
-        wsRef.current = null;
+    // Close WebSocket connection
+    if (wsRef.current) {
+      // Clear ping interval if it exists
+      if (wsRef.current.pingInterval) {
+        clearInterval(wsRef.current.pingInterval);
+        wsRef.current.pingInterval = undefined;
       }
-    };
-  }, [cameraId, streamMode]);
-  
-  // Handle component unmount
-  useEffect(() => {
-    return () => {
-      isComponentMounted.current = false;
-      if (wsRef.current) {
-        wsRef.current.close();
+      
+      // Only attempt to close if not already closed
+      if (wsRef.current.readyState !== WebSocket.CLOSED && 
+          wsRef.current.readyState !== WebSocket.CLOSING) {
+        try {
+          wsRef.current.close();
+        } catch (err) {
+          console.error('Error closing WebSocket:', err);
+        }
       }
-    };
-  }, []);
+      wsRef.current = null;
+    }
+    
+    // Release snapshot URL if it exists
+    if (snapshot) {
+      URL.revokeObjectURL(snapshot);
+    }
+  }, [snapshot]);
   
   // Function to render a frame from base64 data
-  const renderFrame = (base64Data: string) => {
-    if (!isComponentMounted.current) return;
+  const renderFrame = useCallback((base64Data: string) => {
+    if (!isMounted.current) return;
     
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -145,40 +106,151 @@ const WebRTCStream: React.FC<WebRTCStreamProps> = ({
     };
     
     img.src = 'data:image/jpeg;base64,' + base64Data;
-  };
+  }, []);
   
-  // Switch between WebRTC and snapshot modes
-  const toggleStreamMode = async () => {
-    if (streamMode === 'webrtc') {
-      // Switch to snapshot mode
-      try {
-        const blob = await getCameraSnapshot(cameraId);
-        const url = URL.createObjectURL(blob);
-        setSnapshot(url);
-        setStreamMode('snapshot');
-        
-        // Close WebSocket connection
-        if (wsRef.current) {
-          wsRef.current.close();
-          wsRef.current = null;
+  // Connect to WebRTC stream
+  const connectWebSocket = useCallback(() => {
+    // Clean up existing connection first
+    cleanupResources();
+    
+    if (!isMounted.current) return;
+    
+    // Increment connection attempt counter
+    connectionAttemptRef.current += 1;
+    const currentAttempt = connectionAttemptRef.current;
+    
+    setIsLoading(true);
+    setError(null);
+    
+    try {
+      // Create WebSocket connection for signaling
+      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const host = window.location.host;
+      const wsUrl = `${protocol}//${host}/api/webrtc/ws/${cameraId}`;
+      
+      console.log(`Connecting to WebSocket: ${wsUrl}`);
+      
+      const ws = new WebSocket(wsUrl);
+      wsRef.current = ws;
+      
+      ws.onopen = () => {
+        if (!isMounted.current) {
+          ws.close();
+          return;
         }
-      } catch (err) {
-        console.error('Error getting snapshot:', err);
-        setError(err instanceof Error ? err : new Error('Failed to get snapshot'));
-      }
-    } else {
-      // Switch to WebRTC mode
-      if (snapshot) {
-        URL.revokeObjectURL(snapshot);
-        setSnapshot(null);
-      }
-      setStreamMode('webrtc');
+        
+        console.log(`WebSocket connected for camera ${cameraId}`);
+        setIsConnected(true);
+        setIsLoading(false);
+        connectionAttemptRef.current = 0; // Reset counter on successful connection
+        
+        // Set up ping interval to keep the connection alive
+        ws.pingInterval = setInterval(() => {
+          if (ws.readyState === WebSocket.OPEN) {
+            try {
+              ws.send(JSON.stringify({ type: "ping" }));
+            } catch (err) {
+              console.error("Error sending ping:", err);
+            }
+          } else {
+            if (ws.pingInterval) {
+              clearInterval(ws.pingInterval);
+              ws.pingInterval = undefined;
+            }
+          }
+        }, 30000); // 30-second ping
+        
+        // Notify parent about connection
+        notifyConnectionChange(true);
+      };
+      
+      ws.onmessage = (event) => {
+        if (!isMounted.current) return;
+        
+        try {
+          const message = JSON.parse(event.data);
+          
+          if (message.type === 'frame') {
+            // Handle incoming frame (base64 encoded JPEG)
+            renderFrame(message.data);
+          }
+        } catch (err) {
+          console.error('Error processing WebSocket message:', err);
+        }
+      };
+      
+      ws.onerror = (event) => {
+        if (!isMounted.current) return;
+        
+        console.error('WebSocket error:', event);
+        setError(new Error('Failed to connect to video stream'));
+        setIsConnected(false);
+        setIsLoading(false);
+        
+        // Notify parent about disconnection
+        notifyConnectionChange(false);
+        
+        // Attempt to reconnect with exponential backoff
+        if (currentAttempt === connectionAttemptRef.current && connectionAttemptRef.current < 5) {
+          const delay = Math.min(1000 * Math.pow(2, connectionAttemptRef.current), 30000);
+          console.log(`Will attempt reconnection in ${delay}ms (attempt ${connectionAttemptRef.current})`);
+          
+          reconnectTimeoutRef.current = setTimeout(() => {
+            if (isMounted.current) {
+              reconnectTimeoutRef.current = null;
+              connectWebSocket();
+            }
+          }, delay);
+        }
+      };
+      
+      ws.onclose = (event) => {
+        if (!isMounted.current) return;
+        
+        console.log('WebSocket closed:', event.code, event.reason);
+        setIsConnected(false);
+        setIsLoading(false);
+        
+        // Clean up ping interval
+        if (ws.pingInterval) {
+          clearInterval(ws.pingInterval);
+          ws.pingInterval = undefined;
+        }
+        
+        // Notify parent about disconnection
+        notifyConnectionChange(false);
+        
+        // Attempt to reconnect with exponential backoff if not closed cleanly
+        if (event.code !== 1000 && event.code !== 1001 && 
+            currentAttempt === connectionAttemptRef.current && 
+            connectionAttemptRef.current < 5) {
+          
+          const delay = Math.min(1000 * Math.pow(2, connectionAttemptRef.current), 30000);
+          console.log(`WebSocket closed. Will attempt reconnection in ${delay}ms (attempt ${connectionAttemptRef.current})`);
+          
+          reconnectTimeoutRef.current = setTimeout(() => {
+            if (isMounted.current) {
+              reconnectTimeoutRef.current = null;
+              connectWebSocket();
+            }
+          }, delay);
+        }
+      };
+    } catch (err) {
+      if (!isMounted.current) return;
+      
+      console.error('Error setting up WebSocket:', err);
+      setError(err instanceof Error ? err : new Error('Failed to connect to video stream'));
+      setIsLoading(false);
+      
+      // Notify parent about connection failure
+      notifyConnectionChange(false);
     }
-  };
-  
-  // Refresh snapshot
-  const refreshSnapshot = async () => {
-    if (streamMode !== 'snapshot') return;
+  }, [cameraId, cleanupResources, notifyConnectionChange, renderFrame]);
+
+  // Take a snapshot
+  const takeSnapshot = useCallback(async () => {
+    if (!isMounted.current) return;
     
     try {
       setIsLoading(true);
@@ -193,12 +265,35 @@ const WebRTCStream: React.FC<WebRTCStreamProps> = ({
       setSnapshot(url);
       setError(null);
     } catch (err) {
-      console.error('Error refreshing snapshot:', err);
-      setError(err instanceof Error ? err : new Error('Failed to refresh snapshot'));
+      console.error('Error taking snapshot:', err);
+      setError(err instanceof Error ? err : new Error('Failed to take snapshot'));
     } finally {
-      setIsLoading(false);
+      if (isMounted.current) {
+        setIsLoading(false);
+      }
     }
-  };
+  }, [cameraId, snapshot]);
+  
+  // Manual reconnect
+  const handleReconnect = useCallback(() => {
+    // Reset connection attempts
+    connectionAttemptRef.current = 0;
+    connectWebSocket();
+  }, [connectWebSocket]);
+  
+  // Initial connection setup
+  useEffect(() => {
+    connectWebSocket();
+    
+    // Cleanup function
+    return () => {
+      isMounted.current = false;
+      cleanupResources();
+      
+      // Make sure we notify the parent about disconnection on unmount
+      notifyConnectionChange(false);
+    };
+  }, [cameraId, cleanupResources, connectWebSocket, notifyConnectionChange]);
   
   // Render based on current state
   const renderContent = () => {
@@ -219,33 +314,42 @@ const WebRTCStream: React.FC<WebRTCStreamProps> = ({
             variant="primary"
             size="sm"
             className="mt-2"
-            onClick={streamMode === 'webrtc' ? () => setStreamMode('webrtc') : refreshSnapshot}
+            onClick={handleReconnect}
             icon={<RefreshCw size={16} />}
           >
-            Retry
+            Retry Connection
           </Button>
         </div>
       );
     }
     
-    if (streamMode === 'webrtc') {
-      return <canvas ref={canvasRef} className="w-full h-full object-contain rounded-md" />;
-    }
-    
-    if (streamMode === 'snapshot' && snapshot) {
+    if (snapshot) {
       return (
-        <img
-          src={snapshot}
-          alt="Camera snapshot"
-          className="w-full h-full object-contain rounded-md"
-        />
+        <div className="relative w-full h-full">
+          <img
+            src={snapshot}
+            alt="Camera snapshot"
+            className="w-full h-full object-contain rounded-md"
+          />
+          <Button
+            variant="secondary"
+            size="sm"
+            className="absolute top-2 right-2 bg-gray-800 bg-opacity-75 hover:bg-gray-700"
+            onClick={() => {
+              if (snapshot) {
+                URL.revokeObjectURL(snapshot);
+                setSnapshot(null);
+              }
+            }}
+          >
+            Back to Stream
+          </Button>
+        </div>
       );
     }
     
     return (
-      <div className="flex items-center justify-center h-full bg-gray-100 rounded-md">
-        <Loader text="Waiting for stream..." />
-      </div>
+      <canvas ref={canvasRef} className="w-full h-full object-contain rounded-md" />
     );
   };
   
@@ -253,29 +357,17 @@ const WebRTCStream: React.FC<WebRTCStreamProps> = ({
     <div className={`${width} ${height} bg-black rounded-md overflow-hidden relative`}>
       {renderContent()}
       
-      {showControls && (
+      {showControls && !snapshot && !error && isConnected && (
         <div className="absolute bottom-2 right-2 flex space-x-2">
           <Button
             variant="secondary"
             size="sm"
-            onClick={toggleStreamMode}
+            onClick={takeSnapshot}
             className="bg-gray-800 bg-opacity-75 hover:bg-gray-700"
-            icon={streamMode === 'webrtc' ? <Image size={16} /> : <Film size={16} />}
+            icon={<Film size={16} />}
           >
-            {streamMode === 'webrtc' ? 'Snapshot' : 'Stream'}
+            Snapshot
           </Button>
-          
-          {streamMode === 'snapshot' && (
-            <Button
-              variant="secondary"
-              size="sm"
-              onClick={refreshSnapshot}
-              className="bg-gray-800 bg-opacity-75 hover:bg-gray-700"
-              icon={<RefreshCw size={16} />}
-            >
-              Refresh
-            </Button>
-          )}
         </div>
       )}
     </div>

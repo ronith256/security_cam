@@ -1,7 +1,7 @@
 // src/pages/CameraDetail.tsx
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { useParams, Link, useNavigate } from 'react-router-dom';
-import { Edit, ArrowLeft, Image, UserPlus } from 'lucide-react';
+import { Edit, ArrowLeft, Image } from 'lucide-react';
 import PageHeader from '../components/common/PageHeader';
 import Button from '../components/common/Button';
 import Card from '../components/common/Card';
@@ -14,10 +14,7 @@ import TemplateForm from '../components/templates/TemplateForm';
 import { fetchCamera } from '../api/cameras';
 import { createTemplate, updateTemplate } from '../api/templates';
 import { Template } from '../types/template';
-import { getCameraStatus } from '../api/cameras';
 import { useApi } from '../hooks/useApi';
-import { useCamera } from '../hooks/useCamera';
-import { useInterval } from '../hooks/useInterval';
 import Loader from '../components/common/Loader';
 import { useToast } from '../context/ToastContext';
 
@@ -29,18 +26,59 @@ const CameraDetail: React.FC = () => {
   
   const [isTemplateModalOpen, setIsTemplateModalOpen] = useState(false);
   const [selectedTemplate, setSelectedTemplate] = useState<Template | null>(null);
+  const [streamActive, setStreamActive] = useState(false);
+  const [cameraStatus, setCameraStatus] = useState(null);
+
+  // Reference to track if the component is mounted
+  const isMounted = useRef(true);
   
-  const { execute: loadCamera, data: camera, isLoading: isLoadingCamera } = useApi(
+  // This reference will help avoid infinite loops with the status
+  const statusPollingInterval = useRef<number | null>(null);
+  
+  // Load camera details just once
+  const { execute: loadCamera, data: camera, isLoading: isLoadingCamera, error: cameraError } = useApi(
     () => fetchCamera(cameraId),
     {
       showErrorToast: true,
     }
   );
   
-  const { status, isLoading: isLoadingStatus } = useCamera(cameraId, {
-    pollInterval: 2000,
-    autoStart: true,
-  });
+  // Function to fetch camera status
+  const fetchCameraStatus = useCallback(async () => {
+    if (!streamActive || !isMounted.current) return;
+    
+    try {
+      const response = await fetch(`/api/cameras/${cameraId}/status`);
+      if (!response.ok) throw new Error('Failed to fetch camera status');
+      
+      const data = await response.json();
+      if (isMounted.current) {
+        setCameraStatus(data);
+      }
+    } catch (error) {
+      console.error('Error fetching camera status:', error);
+    }
+  }, [cameraId, streamActive]);
+  
+  // Handle stream activation/deactivation
+  const handleStreamActive = useCallback((active: boolean) => {
+    setStreamActive(active);
+    
+    // When stream becomes active, start polling for status
+    if (active && !statusPollingInterval.current) {
+      fetchCameraStatus(); // Fetch immediately
+      
+      // Then set up interval
+      statusPollingInterval.current = window.setInterval(() => {
+        fetchCameraStatus();
+      }, 5000); // Every 5 seconds
+    } 
+    // When stream becomes inactive, stop polling
+    else if (!active && statusPollingInterval.current) {
+      clearInterval(statusPollingInterval.current);
+      statusPollingInterval.current = null;
+    }
+  }, [fetchCameraStatus]);
   
   const { execute: createTemplateApi, isLoading: isCreatingTemplate } = useApi(createTemplate, {
     onSuccess: () => {
@@ -69,6 +107,17 @@ const CameraDetail: React.FC = () => {
     if (cameraId) {
       loadCamera();
     }
+    
+    // Cleanup
+    return () => {
+      isMounted.current = false;
+      
+      // Clear status polling interval
+      if (statusPollingInterval.current) {
+        clearInterval(statusPollingInterval.current);
+        statusPollingInterval.current = null;
+      }
+    };
   }, [cameraId, loadCamera]);
   
   const handleOpenTemplateModal = (template?: Template) => {
@@ -97,11 +146,11 @@ const CameraDetail: React.FC = () => {
     );
   }
   
-  if (!camera) {
+  if (cameraError || !camera) {
     return (
       <div className="text-center py-12">
         <h2 className="text-2xl font-bold text-gray-700">Camera not found</h2>
-        <p className="text-gray-600 mt-2">The camera you're looking for doesn't exist.</p>
+        <p className="text-gray-600 mt-2">The camera you're looking for doesn't exist or couldn't be loaded.</p>
         <Link to="/cameras" className="mt-4 inline-block">
           <Button variant="primary">Back to Cameras</Button>
         </Link>
@@ -144,17 +193,21 @@ const CameraDetail: React.FC = () => {
             className="h-full flex flex-col"
           >
             <div className="flex-grow">
-              <WebRTCStream cameraId={cameraId} height="h-96" />
+              <WebRTCStream 
+                cameraId={cameraId} 
+                height="h-96" 
+                onConnectionChange={handleStreamActive} 
+              />
             </div>
           </Card>
         </div>
         
         <div className="space-y-6">
-          {status && (
-            <CameraStats status={status} />
+          {cameraStatus && streamActive && (
+            <CameraStats status={cameraStatus} />
           )}
           
-          {camera.recognize_faces && (
+          {camera.recognize_faces && streamActive && (
             <FaceDetections cameraId={cameraId} />
           )}
         </div>
