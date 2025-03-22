@@ -220,16 +220,26 @@ class CameraManager:
     
     async def get_jpeg_frame(self, camera_id: int) -> Optional[bytes]:
         """Get the latest frame as JPEG bytes"""
+        logger.debug(f"Request for JPEG frame from camera {camera_id}")
+        
         # Ensure camera is connected
         if not await self.ensure_camera_connected(camera_id):
+            logger.error(f"Failed to connect to camera {camera_id}")
             return None
             
-        frame_data = await self.get_frame(camera_id)
-        if frame_data:
-            frame, _ = frame_data
-            _, jpeg = cv2.imencode(".jpg", frame)
-            return jpeg.tobytes()
-        return None
+        try:
+            frame_data = await self.get_frame(camera_id)
+            if frame_data:
+                frame, timestamp = frame_data
+                logger.debug(f"Got frame from camera {camera_id}, timestamp: {timestamp}")
+                _, jpeg = cv2.imencode(".jpg", frame)
+                return jpeg.tobytes()
+            else:
+                logger.warning(f"No frame data available for camera {camera_id}")
+                return None
+        except Exception as e:
+            logger.exception(f"Error getting JPEG frame for camera {camera_id}: {str(e)}")
+            return None
     
     async def set_camera_property(self, camera_id: int, property_name: str, value) -> bool:
         """Set a property for a specific camera"""

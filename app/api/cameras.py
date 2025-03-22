@@ -1,3 +1,6 @@
+from datetime import datetime
+import time
+import cv2
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update, delete
@@ -270,3 +273,101 @@ async def remove_camera_from_manager(camera_id: int):
             logger.error(f"Failed to remove camera {camera_id} from manager")
     except Exception as e:
         logger.exception(f"Error removing camera from manager: {str(e)}")
+
+@router.get("/{camera_id}/test", response_model=Dict[str, Any])
+async def test_camera_connection(
+    camera_id: int,
+    db: AsyncSession = Depends(get_db)
+):
+    """Test the connection to a camera and return diagnostic information"""
+    # Check if camera exists
+    camera = await db.get(Camera, camera_id)
+    if camera is None:
+        raise HTTPException(status_code=404, detail="Camera not found")
+    
+    # Get camera manager
+    camera_manager = await get_camera_manager()
+    
+    # Start with basic test info
+    test_results = {
+        "camera_id": camera_id,
+        "camera_name": camera.name,
+        "rtsp_url": camera.rtsp_url,
+        "timestamp": datetime.now().isoformat(),
+        "camera_enabled": camera.enabled,
+        "tests": {}
+    }
+    
+    # Test 1: Check if camera is in manager
+    in_manager = camera_id in camera_manager.cameras
+    test_results["tests"]["in_manager"] = in_manager
+    
+    # Test 2: Try to ensure camera is connected
+    connection_success = False
+    connection_error = None
+    try:
+        connection_success = await camera_manager.ensure_camera_connected(camera_id)
+    except Exception as e:
+        connection_error = str(e)
+    
+    test_results["tests"]["connection"] = {
+        "success": connection_success,
+        "error": connection_error
+    }
+    
+    # Test 3: Try to get a single frame
+    frame_success = False
+    frame_error = None
+    frame_info = {}
+    
+    if connection_success:
+        try:
+            processor = camera_manager.cameras[camera_id]
+            frame_data = processor.get_latest_frame()
+            
+            if frame_data:
+                frame, timestamp = frame_data
+                frame_success = True
+                frame_info = {
+                    "shape": frame.shape,
+                    "type": str(frame.dtype),
+                    "timestamp": timestamp,
+                    "age": time.time() - timestamp
+                }
+                
+                # Convert to JPEG for test
+                _, jpeg_data = cv2.imencode(".jpg", frame)
+                jpeg_size = len(jpeg_data.tobytes())
+                frame_info["jpeg_size"] = jpeg_size
+            else:
+                frame_error = "No frame available"
+        except Exception as e:
+            frame_error = str(e)
+    
+    test_results["tests"]["frame"] = {
+        "success": frame_success,
+        "error": frame_error,
+        "info": frame_info
+    }
+    
+    # Test 4: Processor info
+    processor_info = {}
+    if in_manager:
+        processor = camera_manager.cameras[camera_id]
+        processor_info = {
+            "connected": processor.connected,
+            "processing": processor.processing,
+            "fps": processor.fps,
+            "last_frame_time": processor.last_frame_time,
+            "last_processed_time": processor.last_processed_time,
+            "features": {
+                "detect_people": processor.detect_people,
+                "count_people": processor.count_people,
+                "recognize_faces": processor.recognize_faces,
+                "template_matching": processor.template_matching
+            }
+        }
+    
+    test_results["processor_info"] = processor_info
+    
+    return test_results

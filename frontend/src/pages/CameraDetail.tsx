@@ -1,6 +1,6 @@
 // src/pages/CameraDetail.tsx
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { useParams, Link, useNavigate } from 'react-router-dom';
+import { useParams, Link } from 'react-router-dom';
 import { Edit, ArrowLeft, Image } from 'lucide-react';
 import PageHeader from '../components/common/PageHeader';
 import Button from '../components/common/Button';
@@ -11,7 +11,7 @@ import FaceDetections from '../components/faces/FaceDetections';
 import TemplateList from '../components/templates/TemplateList';
 import Modal from '../components/common/Modal';
 import TemplateForm from '../components/templates/TemplateForm';
-import { fetchCamera } from '../api/cameras';
+import { fetchCamera, getCameraStatus } from '../api/cameras';
 import { createTemplate, updateTemplate } from '../api/templates';
 import { Template } from '../types/template';
 import { useApi } from '../hooks/useApi';
@@ -21,7 +21,6 @@ import { useToast } from '../context/ToastContext';
 const CameraDetail: React.FC = () => {
   const { id } = useParams<{ id: string }>();
   const cameraId = parseInt(id || '0');
-  const navigate = useNavigate();
   const { showToast } = useToast();
   
   const [isTemplateModalOpen, setIsTemplateModalOpen] = useState(false);
@@ -32,54 +31,19 @@ const CameraDetail: React.FC = () => {
   // Reference to track if the component is mounted
   const isMounted = useRef(true);
   
-  // This reference will help avoid infinite loops with the status
+  // Track status polling interval
   const statusPollingInterval = useRef<number | null>(null);
   
-  // Load camera details just once
+  // Load camera details - with stable reference to prevent re-fetching
+  const cameraIdRef = useRef(cameraId);
   const { execute: loadCamera, data: camera, isLoading: isLoadingCamera, error: cameraError } = useApi(
-    () => fetchCamera(cameraId),
+    useCallback(() => fetchCamera(cameraIdRef.current), []),
     {
       showErrorToast: true,
     }
   );
   
-  // Function to fetch camera status
-  const fetchCameraStatus = useCallback(async () => {
-    if (!streamActive || !isMounted.current) return;
-    
-    try {
-      const response = await fetch(`/api/cameras/${cameraId}/status`);
-      if (!response.ok) throw new Error('Failed to fetch camera status');
-      
-      const data = await response.json();
-      if (isMounted.current) {
-        setCameraStatus(data);
-      }
-    } catch (error) {
-      console.error('Error fetching camera status:', error);
-    }
-  }, [cameraId, streamActive]);
-  
-  // Handle stream activation/deactivation
-  const handleStreamActive = useCallback((active: boolean) => {
-    setStreamActive(active);
-    
-    // When stream becomes active, start polling for status
-    if (active && !statusPollingInterval.current) {
-      fetchCameraStatus(); // Fetch immediately
-      
-      // Then set up interval
-      statusPollingInterval.current = window.setInterval(() => {
-        fetchCameraStatus();
-      }, 5000); // Every 5 seconds
-    } 
-    // When stream becomes inactive, stop polling
-    else if (!active && statusPollingInterval.current) {
-      clearInterval(statusPollingInterval.current);
-      statusPollingInterval.current = null;
-    }
-  }, [fetchCameraStatus]);
-  
+  // Template API hooks
   const { execute: createTemplateApi, isLoading: isCreatingTemplate } = useApi(createTemplate, {
     onSuccess: () => {
       setIsTemplateModalOpen(false);
@@ -102,19 +66,54 @@ const CameraDetail: React.FC = () => {
       },
     }
   );
+
+  // Function to handle WebRTC connection state
+  const handleStreamConnection = useCallback((active: boolean) => {
+    console.log(`Stream connection state changed: ${active ? 'connected' : 'disconnected'}`);
+    
+    setStreamActive(active);
+    
+    // When stream becomes active, start polling for status
+    if (active && !statusPollingInterval.current) {
+      const fetchStatus = async () => {
+        if (!isMounted.current) return;
+        
+        try {
+          const status = await getCameraStatus(cameraId);
+          if (isMounted.current) {
+            setCameraStatus(status);
+          }
+        } catch (error) {
+          console.error('Error fetching camera status:', error);
+        }
+      };
+      
+      // Fetch immediately
+      fetchStatus();
+      
+      // Set up interval - 5 second interval to avoid excessive requests
+      statusPollingInterval.current = window.setInterval(fetchStatus, 5000);
+    } 
+    // When stream becomes inactive, stop polling
+    else if (!active && statusPollingInterval.current) {
+      window.clearInterval(statusPollingInterval.current);
+      statusPollingInterval.current = null;
+    }
+  }, [cameraId]);
   
+  // Load camera details once on mount
   useEffect(() => {
     if (cameraId) {
       loadCamera();
     }
     
-    // Cleanup
+    // Cleanup function
     return () => {
       isMounted.current = false;
       
       // Clear status polling interval
       if (statusPollingInterval.current) {
-        clearInterval(statusPollingInterval.current);
+        window.clearInterval(statusPollingInterval.current);
         statusPollingInterval.current = null;
       }
     };
@@ -196,7 +195,7 @@ const CameraDetail: React.FC = () => {
               <WebRTCStream 
                 cameraId={cameraId} 
                 height="h-96" 
-                onConnectionChange={handleStreamActive} 
+                onConnectionChange={handleStreamConnection} 
               />
             </div>
           </Card>

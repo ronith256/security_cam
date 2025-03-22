@@ -5,6 +5,9 @@ import Button from '../common/Button';
 import Loader from '../common/Loader';
 import { getCameraSnapshot } from '../../api/cameras';
 
+// Import the WebSocket base URL from our API config
+import { wsBaseUrl } from '../../api/index';
+
 interface WebSocketWithPing extends WebSocket {
   pingInterval?: NodeJS.Timeout;
 }
@@ -33,6 +36,7 @@ const WebRTCStream: React.FC<WebRTCStreamProps> = ({
   const wsRef = useRef<WebSocketWithPing | null>(null);
   const connectionAttemptRef = useRef<number>(0);
   const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const cameraIdRef = useRef<number>(cameraId); // Store camera ID to avoid closure issues
   
   // To track component mount state
   const isMounted = useRef(true);
@@ -51,6 +55,7 @@ const WebRTCStream: React.FC<WebRTCStreamProps> = ({
 
   // Clean up resources
   const cleanupResources = useCallback(() => {
+    console.log('Cleaning up WebRTC resources');
     // Clear any reconnect timeouts
     if (reconnectTimeoutRef.current) {
       clearTimeout(reconnectTimeoutRef.current);
@@ -69,6 +74,7 @@ const WebRTCStream: React.FC<WebRTCStreamProps> = ({
       if (wsRef.current.readyState !== WebSocket.CLOSED && 
           wsRef.current.readyState !== WebSocket.CLOSING) {
         try {
+          console.log('Closing WebSocket connection');
           wsRef.current.close();
         } catch (err) {
           console.error('Error closing WebSocket:', err);
@@ -123,10 +129,13 @@ const WebRTCStream: React.FC<WebRTCStreamProps> = ({
     setError(null);
     
     try {
-      // Create WebSocket connection for signaling
-      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const host = window.location.host;
-      const wsUrl = `${protocol}//${host}/api/webrtc/ws/${cameraId}`;
+      // Get the WebSocket URL using our API configuration
+      // Extract the base path from wsBaseUrl and ensure it ends with /api if it doesn't contain it
+      const baseUrl = wsBaseUrl.endsWith('/api') ? wsBaseUrl : 
+                    (wsBaseUrl.includes('/api') ? wsBaseUrl : `${wsBaseUrl}/api`);
+      
+      // Construct the WebSocket URL for the WebRTC endpoint
+      const wsUrl = `${baseUrl}/webrtc/ws/${cameraIdRef.current}`;
       
       console.log(`Connecting to WebSocket: ${wsUrl}`);
       
@@ -139,7 +148,7 @@ const WebRTCStream: React.FC<WebRTCStreamProps> = ({
           return;
         }
         
-        console.log(`WebSocket connected for camera ${cameraId}`);
+        console.log(`WebSocket connected for camera ${cameraIdRef.current}`);
         setIsConnected(true);
         setIsLoading(false);
         connectionAttemptRef.current = 0; // Reset counter on successful connection
@@ -173,6 +182,11 @@ const WebRTCStream: React.FC<WebRTCStreamProps> = ({
           if (message.type === 'frame') {
             // Handle incoming frame (base64 encoded JPEG)
             renderFrame(message.data);
+          } else if (message.type === 'pong') {
+            // Pong response received (optional handling)
+            console.debug('Received pong from server');
+          } else if (message.type === 'info') {
+            console.log(`Info from server: ${message.message || ''}`);
           }
         } catch (err) {
           console.error('Error processing WebSocket message:', err);
@@ -246,7 +260,7 @@ const WebRTCStream: React.FC<WebRTCStreamProps> = ({
       // Notify parent about connection failure
       notifyConnectionChange(false);
     }
-  }, [cameraId, cleanupResources, notifyConnectionChange, renderFrame]);
+  }, [cleanupResources, notifyConnectionChange, renderFrame]);
 
   // Take a snapshot
   const takeSnapshot = useCallback(async () => {
@@ -260,7 +274,7 @@ const WebRTCStream: React.FC<WebRTCStreamProps> = ({
         URL.revokeObjectURL(snapshot);
       }
       
-      const blob = await getCameraSnapshot(cameraId);
+      const blob = await getCameraSnapshot(cameraIdRef.current);
       const url = URL.createObjectURL(blob);
       setSnapshot(url);
       setError(null);
@@ -272,7 +286,7 @@ const WebRTCStream: React.FC<WebRTCStreamProps> = ({
         setIsLoading(false);
       }
     }
-  }, [cameraId, snapshot]);
+  }, [snapshot]);
   
   // Manual reconnect
   const handleReconnect = useCallback(() => {
@@ -281,12 +295,22 @@ const WebRTCStream: React.FC<WebRTCStreamProps> = ({
     connectWebSocket();
   }, [connectWebSocket]);
   
+  // Store camera ID when it changes
+  useEffect(() => {
+    cameraIdRef.current = cameraId;
+  }, [cameraId]);
+  
   // Initial connection setup
   useEffect(() => {
+    // Set isMounted to true
+    isMounted.current = true;
+    
+    console.log(`Initializing WebRTC stream for camera ${cameraId}`);
     connectWebSocket();
     
     // Cleanup function
     return () => {
+      console.log(`Cleaning up WebRTC stream for camera ${cameraId}`);
       isMounted.current = false;
       cleanupResources();
       

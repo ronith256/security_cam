@@ -9,4 +9,10 @@ const api = axios.create({
   },
 });
 
+// Export the API base URL for components that need direct access
+export const apiBaseUrl = import.meta.env.VITE_API_URL || 'http://localhost:8000/api';
+export const wsBaseUrl = import.meta.env.VITE_API_URL 
+  ? import.meta.env.VITE_API_URL.replace(/^http/, 'ws') 
+  : 'ws://localhost:8000/api';
+
 export default api;

@@ -69,6 +69,8 @@ class StreamProcessor:
     async def connect(self) -> bool:
         """Connect to the RTSP stream"""
         try:
+            logger.info(f"Attempting to connect to RTSP stream: {self.rtsp_url}")
+            
             # OpenCV VideoCapture is blocking, so run in a thread pool
             loop = asyncio.get_event_loop()
             self.cap = await loop.run_in_executor(
@@ -78,6 +80,14 @@ class StreamProcessor:
             if not self.cap.isOpened():
                 logger.error(f"Failed to open RTSP stream: {self.rtsp_url}")
                 return False
+            
+            # Test read a frame to verify connection
+            success, test_frame = await loop.run_in_executor(None, self.cap.read)
+            if not success or test_frame is None:
+                logger.error(f"Connected to stream {self.rtsp_url} but could not read a frame")
+                return False
+                
+            logger.info(f"Successfully read test frame from {self.rtsp_url}, dimensions: {test_frame.shape}")
             
             # Set buffer size to reduce latency
             self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
@@ -127,19 +137,30 @@ class StreamProcessor:
         
         self.processing = True
         loop = asyncio.get_event_loop()
+        frames_processed = 0
+        processing_start_time = time.time()
         
         try:
+            logger.info(f"Starting stream processing for camera {self.camera_id}")
+            
             while self.connected and self.processing:
                 process_start = time.time()
                 
                 # Read frame from the stream (in thread pool)
+                logger.debug(f"Reading frame from camera {self.camera_id}")
                 ret, frame = await loop.run_in_executor(None, lambda: self.cap.read())
                 
                 if not ret:
                     logger.warning(f"Failed to read frame from camera {self.camera_id}")
                     # Try to reconnect
                     await self.reconnect()
+                    await asyncio.sleep(1)  # Wait before trying again
                     continue
+                
+                frames_processed += 1
+                if frames_processed % 100 == 0:
+                    elapsed = time.time() - processing_start_time
+                    logger.info(f"Camera {self.camera_id}: Processed {frames_processed} frames in {elapsed:.2f}s ({frames_processed/elapsed:.2f} FPS)")
                 
                 # Update the latest frame
                 async with self.frame_lock:
@@ -161,6 +182,7 @@ class StreamProcessor:
                 self.frame_count += 1
                 if time.time() - self.last_fps_update >= 1.0:
                     self.fps = self.frame_count / (time.time() - self.last_fps_update)
+                    logger.debug(f"Camera {self.camera_id} processing FPS: {self.fps:.2f}")
                     self.frame_count = 0
                     self.last_fps_update = time.time()
                 
@@ -174,6 +196,7 @@ class StreamProcessor:
             logger.exception(f"Error in process_stream for camera {self.camera_id}: {str(e)}")
         finally:
             self.processing = False
+            logger.info(f"Stopped stream processing for camera {self.camera_id}")
     
     async def process_frame(self, frame: np.ndarray) -> np.ndarray:
         """Apply AI processing to a video frame"""
@@ -314,10 +337,18 @@ class StreamProcessor:
     
     def get_latest_frame(self) -> Optional[Tuple[np.ndarray, float]]:
         """Get the latest frame and its timestamp"""
+        if not self.connected:
+            logger.warning(f"Attempted to get frame from camera {self.camera_id} but not connected")
+            return None
+            
         if self.latest_processed_frame is not None:
+            logger.debug(f"Returning latest processed frame for camera {self.camera_id}")
             return self.latest_processed_frame.copy(), self.last_processed_time
         elif self.latest_frame is not None:
+            logger.debug(f"Returning latest raw frame for camera {self.camera_id}")
             return self.latest_frame.copy(), self.last_frame_time
+            
+        logger.warning(f"No frames available for camera {self.camera_id}")
         return None
     
     async def reconnect(self, max_attempts: int = 3) -> bool:
