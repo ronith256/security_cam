@@ -9,13 +9,15 @@ import logging
 from typing import Dict, Any, List, Set
 import os
 import uuid
+import gc
+import time
+import weakref
 from aiortc import RTCPeerConnection, RTCSessionDescription, MediaStreamTrack, RTCIceCandidate
 from aiortc.contrib.media import MediaBlackhole, MediaRelay
 from av import VideoFrame
 import fractions
 import numpy as np
 import threading
-import time
 from datetime import datetime
 
 from app.core.camera_manager import get_camera_manager
@@ -25,12 +27,54 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
-# Relay for sharing a single webcam feed
-relay = MediaRelay()
+# Relay for sharing a single webcam feed (with memory management)
+class ManagedMediaRelay(MediaRelay):
+    def __init__(self):
+        super().__init__()
+        # Track when tracks were last used
+        self.track_last_used = {}
+        # Maximum tracks to keep in memory
+        self.max_tracks = 20
+        # Cleanup interval in seconds
+        self.cleanup_interval = 60
+        self.last_cleanup = time.time()
+    
+    def subscribe(self, track):
+        # Perform cleanup if needed
+        current_time = time.time()
+        if current_time - self.last_cleanup > self.cleanup_interval:
+            self._cleanup_old_tracks()
+            self.last_cleanup = current_time
+        
+        # Track usage time
+        result = super().subscribe(track)
+        self.track_last_used[id(result)] = current_time
+        return result
+    
+    def _cleanup_old_tracks(self):
+        """Remove old tracks to prevent memory leaks"""
+        if len(self.track_last_used) <= self.max_tracks:
+            return
+        
+        # Sort tracks by last used time
+        sorted_tracks = sorted(self.track_last_used.items(), key=lambda x: x[1])
+        
+        # Remove oldest tracks beyond our limit
+        tracks_to_remove = sorted_tracks[:len(sorted_tracks) - self.max_tracks]
+        for track_id, _ in tracks_to_remove:
+            self.track_last_used.pop(track_id, None)
+        
+        # Force garbage collection
+        gc.collect()
+        logger.info(f"Cleaned up {len(tracks_to_remove)} old media tracks")
+
+# Create managed relay instance
+relay = ManagedMediaRelay()
 
 # In-memory storage for peer connections and video tracks
 pcs = set()
 camera_tracks = {}  # Map of camera_id to VideoStreamTrack
+pc_timestamps = {}  # Track when peer connections were created
 
 class RTSPVideoStreamTrack(MediaStreamTrack):
     """
@@ -47,6 +91,17 @@ class RTSPVideoStreamTrack(MediaStreamTrack):
         self._last_frame_time = 0
         self._lock = threading.Lock()
         self._current_frame = None
+        
+        # Add frame caching to reduce processing load
+        self._cached_video_frame = None
+        self._cache_expiry = 0.1  # 100ms cache validity
+        self._last_cache_update = 0
+        
+        # Limit resolution based on high_quality flag
+        self._frame_size = (1280, 720) if high_quality else (640, 360)
+        
+        # Track reference count to avoid memory leaks
+        self._ref_count = 0
         
         # Start frame capture thread
         self._start_capture_thread()
@@ -69,7 +124,8 @@ class RTSPVideoStreamTrack(MediaStreamTrack):
                         self._current_frame = frame
                 
                 # Limit capture rate to avoid excessive CPU usage
-                capture_interval = 1/30  # 30 fps max
+                # Adjust based on quality - high quality gets more frames
+                capture_interval = 1/30 if self.high_quality else 1/15  # 30 or 15 fps
                 time.sleep(max(0, capture_interval - (time.time() - self._last_frame_time)))
                 self._last_frame_time = time.time()
         except Exception as e:
@@ -88,6 +144,9 @@ class RTSPVideoStreamTrack(MediaStreamTrack):
                 nparr = np.frombuffer(jpeg_frame, np.uint8)
                 img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
                 
+                # Resize to target resolution to control memory usage
+                img = cv2.resize(img, self._frame_size)
+                
                 # Add timestamp overlay
                 timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 cv2.putText(
@@ -102,12 +161,21 @@ class RTSPVideoStreamTrack(MediaStreamTrack):
                 
                 return img
         except Exception as e:
-            logger.error(f"Error getting frame for camera {self.camera_id}: {str(e)}")
+            if "No frame data available" not in str(e):  # Don't log expected message
+                logger.error(f"Error getting frame for camera {self.camera_id}: {str(e)}")
         
         return None
     
     async def recv(self):
         """Return a frame of video"""
+        current_time = time.time()
+        
+        # Check if we can use the cached frame
+        if (self._cached_video_frame is not None and 
+            current_time - self._last_cache_update < self._cache_expiry):
+            return self._cached_video_frame.copy()
+        
+        # Get a new frame
         frame = None
         with self._lock:
             frame = self._current_frame
@@ -115,7 +183,7 @@ class RTSPVideoStreamTrack(MediaStreamTrack):
         if frame is None:
             # If no frame yet, return blank frame (black image)
             pts, time_base = await self.next_timestamp()
-            width, height = 640, 480
+            width, height = self._frame_size
             frame = np.zeros((height, width, 3), np.uint8)
         else:
             pts, time_base = await self.next_timestamp()
@@ -128,7 +196,13 @@ class RTSPVideoStreamTrack(MediaStreamTrack):
         video_frame.pts = pts
         video_frame.time_base = time_base
         
+        # Update cache
+        self._cached_video_frame = video_frame
+        self._last_cache_update = current_time
+        
+        # Increment frame counter
         self._frame_counter += 1
+        
         return video_frame
     
     async def next_timestamp(self):
@@ -138,12 +212,65 @@ class RTSPVideoStreamTrack(MediaStreamTrack):
         else:
             self._timestamp = 0
         
-        return self._timestamp, fractions.Fraction(1, 30)  # 30 fps
+        # Use appropriate framerate based on quality
+        framerate = 30 if self.high_quality else 15
+        return self._timestamp, fractions.Fraction(1, framerate)
+    
+    def add_ref(self):
+        """Increment reference count"""
+        self._ref_count += 1
+        return self
+    
+    def remove_ref(self):
+        """Decrement reference count and stop if zero"""
+        self._ref_count -= 1
+        if self._ref_count <= 0:
+            self.stop()
     
     def stop(self):
         """Stop the track"""
-        self._running = False
-        super().stop()
+        if self._running:
+            self._running = False
+            self._current_frame = None
+            self._cached_video_frame = None
+            super().stop()
+            logger.info(f"Stopped video track for camera {self.camera_id}")
+
+# Regular cleanup task for peer connections
+async def periodic_pc_cleanup():
+    """Periodically clean up old peer connections to prevent memory leaks"""
+    while True:
+        try:
+            now = time.time()
+            expired_pcs = []
+            
+            # Find expired peer connections (older than 5 minutes with no activity)
+            for pc in pcs:
+                pc_id = id(pc)
+                if pc_id in pc_timestamps and now - pc_timestamps[pc_id] > 300:  # 5 minutes
+                    expired_pcs.append(pc)
+            
+            # Close expired peer connections
+            for pc in expired_pcs:
+                pc_id = id(pc)
+                logger.info(f"Closing expired peer connection {pc_id}")
+                await pc.close()
+                if pc in pcs:
+                    pcs.remove(pc)
+                pc_timestamps.pop(pc_id, None)
+            
+            # Log status
+            if expired_pcs:
+                logger.info(f"Cleaned up {len(expired_pcs)} expired peer connections, {len(pcs)} remaining")
+                
+                # Force garbage collection after cleanup
+                gc.collect()
+        
+        except Exception as e:
+            logger.exception(f"Error in peer connection cleanup: {str(e)}")
+        
+        # Run every minute
+        await asyncio.sleep(60)
 
 class WebRTCManager:
     """
@@ -155,19 +282,92 @@ class WebRTCManager:
         self.snapshot_connections = {}  # camera_id -> [websocket]
         self._lock = asyncio.Lock()
         self._snapshot_tasks = {}   # camera_id -> asyncio.Task
+        
+        # Memory management settings
+        self.max_connections_per_camera = 5
+        self.inactive_timeout = 60  # seconds
+        self.last_cleanup = time.time()
+        self.cleanup_interval = 60  # seconds
+        
+        # Start periodic cleanup
+        asyncio.create_task(self._periodic_cleanup())
+    
+    async def _periodic_cleanup(self):
+        """Periodic cleanup of resources"""
+        while True:
+            try:
+                await self._cleanup_resources()
+                await asyncio.sleep(self.cleanup_interval)
+            except Exception as e:
+                logger.exception(f"Error in periodic cleanup: {str(e)}")
+                await asyncio.sleep(self.cleanup_interval)
+    
+    async def _cleanup_resources(self):
+        """Clean up inactive connections and tracks"""
+        now = time.time()
+        
+        # Skip if we ran cleanup recently
+        if now - self.last_cleanup < self.cleanup_interval:
+            return
+        
+        self.last_cleanup = now
+        
+        async with self._lock:
+            # Clean up peer connections by camera
+            for camera_id, connections in list(self.peer_connections.items()):
+                # Filter out closed connections
+                active_connections = [pc for pc in connections 
+                                    if pc.connectionState not in ["closed", "failed"]]
+                
+                if len(active_connections) == 0 and camera_id in self.camera_tracks:
+                    # No active connections, stop the track
+                    self.camera_tracks[camera_id].stop()
+                    del self.camera_tracks[camera_id]
+                    logger.info(f"Removed unused camera track for camera {camera_id}")
+                
+                # Update the list
+                if active_connections:
+                    self.peer_connections[camera_id] = active_connections
+                else:
+                    del self.peer_connections[camera_id]
+            
+            # Clean up snapshot tasks
+            for camera_id, task in list(self._snapshot_tasks.items()):
+                if task.done() or camera_id not in self.snapshot_connections:
+                    if camera_id in self._snapshot_tasks:
+                        del self._snapshot_tasks[camera_id]
+        
+        # Run garbage collection
+        gc.collect()
+        logger.info(f"Cleanup complete: {len(self.camera_tracks)} active camera tracks")
     
     async def create_peer_connection(self, camera_id: int):
         """Create a new RTCPeerConnection"""
+        async with self._lock:
+            # Check connection limit for this camera
+            if (camera_id in self.peer_connections and 
+                len(self.peer_connections[camera_id]) >= self.max_connections_per_camera):
+                # Find and close the oldest connection
+                if self.peer_connections[camera_id]:
+                    oldest_pc = self.peer_connections[camera_id][0]
+                    await oldest_pc.close()
+                    self.peer_connections[camera_id].remove(oldest_pc)
+                    logger.info(f"Closed oldest connection for camera {camera_id} (limit reached)")
+        
         pc = RTCPeerConnection()
+        pc_id = id(pc)
+        pc_timestamps[pc_id] = time.time()
         
         # Keep track of this peer connection
-        if camera_id not in self.peer_connections:
-            self.peer_connections[camera_id] = []
-        self.peer_connections[camera_id].append(pc)
+        async with self._lock:
+            if camera_id not in self.peer_connections:
+                self.peer_connections[camera_id] = []
+            self.peer_connections[camera_id].append(pc)
+            pcs.add(pc)
         
         # Create/get video track for this camera if needed
         if camera_id not in self.camera_tracks:
-            self.camera_tracks[camera_id] = RTSPVideoStreamTrack(camera_id, high_quality=True)
+            self.camera_tracks[camera_id] = RTSPVideoStreamTrack(camera_id, high_quality=True).add_ref()
         
         # Add track to peer connection
         pc.addTrack(relay.subscribe(self.camera_tracks[camera_id]))
@@ -175,6 +375,7 @@ class WebRTCManager:
         # Handle ICE connection state
         @pc.on("iceconnectionstatechange")
         async def on_iceconnectionstatechange():
+            pc_timestamps[pc_id] = time.time()  # Update timestamp on activity
             logger.info(f"ICE connection state for camera {camera_id}: {pc.iceConnectionState}")
             if pc.iceConnectionState == "failed" or pc.iceConnectionState == "closed":
                 await self.close_peer_connection(pc, camera_id)
@@ -182,6 +383,7 @@ class WebRTCManager:
         # Handle connection state
         @pc.on("connectionstatechange")
         async def on_connectionstatechange():
+            pc_timestamps[pc_id] = time.time()  # Update timestamp on activity
             logger.info(f"Connection state for camera {camera_id}: {pc.connectionState}")
             if pc.connectionState == "failed" or pc.connectionState == "closed":
                 await self.close_peer_connection(pc, camera_id)
@@ -194,14 +396,21 @@ class WebRTCManager:
         await pc.close()
         
         # Remove from tracking
-        if camera_id in self.peer_connections and pc in self.peer_connections[camera_id]:
-            self.peer_connections[camera_id].remove(pc)
-        
-        # If no more connections for this camera, clean up track
-        if camera_id in self.peer_connections and not self.peer_connections[camera_id]:
-            if camera_id in self.camera_tracks:
-                self.camera_tracks[camera_id].stop()
-                del self.camera_tracks[camera_id]
+        async with self._lock:
+            if camera_id in self.peer_connections and pc in self.peer_connections[camera_id]:
+                self.peer_connections[camera_id].remove(pc)
+            
+            if pc in pcs:
+                pcs.remove(pc)
+            
+            pc_id = id(pc)
+            pc_timestamps.pop(pc_id, None)
+            
+            # If no more connections for this camera, clean up track
+            if camera_id in self.peer_connections and not self.peer_connections[camera_id]:
+                if camera_id in self.camera_tracks:
+                    self.camera_tracks[camera_id].remove_ref()
+                    del self.camera_tracks[camera_id]
     
     async def connect_snapshot(self, camera_id: int, websocket: WebSocket):
         """Register a new client connection for snapshot mode"""
@@ -297,8 +506,39 @@ class WebRTCManager:
 # Create singleton instance
 webrtc_manager = WebRTCManager()
 
+# Start cleanup task 
+cleanup_task = None
+
 # Create router
 router = APIRouter()
+
+@router.on_event("startup")
+async def startup_event():
+    """Start background tasks when router starts"""
+    global cleanup_task
+    cleanup_task = asyncio.create_task(periodic_pc_cleanup())
+
+@router.on_event("shutdown")
+async def shutdown_event():
+    """Clean up resources when router shuts down"""
+    global cleanup_task
+    if cleanup_task:
+        cleanup_task.cancel()
+        try:
+            await cleanup_task
+        except asyncio.CancelledError:
+            pass
+    
+    # Close all peer connections
+    coros = [pc.close() for pc in pcs]
+    if coros:
+        await asyncio.gather(*coros, return_exceptions=True)
+    pcs.clear()
+    
+    # Clear all tracks
+    for track in camera_tracks.values():
+        track.stop()
+    camera_tracks.clear()
 
 @router.websocket("/snapshot/{camera_id}")
 async def snapshot_endpoint(websocket: WebSocket, camera_id: int):
@@ -401,9 +641,20 @@ async def webrtc_ice_candidate(
     if camera_id in webrtc_manager.peer_connections:
         # Add ICE candidate to all peer connections for this camera
         for pc in webrtc_manager.peer_connections[camera_id]:
-            # Create ICE candidate - the first parameter is the candidate string, not a named parameter
-            ice_candidate = RTCIceCandidate(candidate, sdpMid, sdpMLineIndex)
-            await pc.addIceCandidate(ice_candidate)
+            if pc.connectionState not in ["closed", "failed"]:
+                try:
+                    # Use the createIceCandidate method which handles the parsing internally
+                    from aiortc.sdp import candidate_from_sdp
+                    
+                    # Mock an SDP line for the candidate
+                    sdp_line = "a=" + candidate
+                    ice = candidate_from_sdp(sdp_line)
+                    ice.sdpMid = sdpMid
+                    ice.sdpMLineIndex = sdpMLineIndex
+                    
+                    await pc.addIceCandidate(ice)
+                except Exception as e:
+                    logger.exception(f"Error adding ICE candidate: {str(e)}")
     
     return {"success": True}
 

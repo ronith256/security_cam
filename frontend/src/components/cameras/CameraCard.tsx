@@ -1,5 +1,5 @@
 // src/components/cameras/CameraCard.tsx
-import React, { useState } from 'react';
+import React, { useState, useCallback } from 'react';
 import { Link } from 'react-router-dom';
 import { Camera, Play, Pause, Eye, Edit, Trash2 } from 'lucide-react';
 import Card from '../common/Card';
@@ -13,9 +13,15 @@ interface CameraCardProps {
   camera: CameraType;
   onDelete: (id: number) => void;
   onUpdate: (camera: CameraType) => void;
+  onConnectionChange?: (id: number, isConnected: boolean) => void;
 }
 
-const CameraCard: React.FC<CameraCardProps> = ({ camera, onDelete, onUpdate }) => {
+const CameraCard: React.FC<CameraCardProps> = ({ 
+  camera, 
+  onDelete, 
+  onUpdate,
+  onConnectionChange
+}) => {
   const [isEnabled, setIsEnabled] = useState(camera.enabled);
   const { showToast } = useToast();
 
@@ -43,6 +49,13 @@ const CameraCard: React.FC<CameraCardProps> = ({ camera, onDelete, onUpdate }) =
       await executeDelete(camera.id);
     }
   };
+
+  // Handle connection state changes from the stream
+  const handleConnectionChange = useCallback((isConnected: boolean) => {
+    if (onConnectionChange) {
+      onConnectionChange(camera.id, isConnected);
+    }
+  }, [camera.id, onConnectionChange]);
 
   return (
     <Card

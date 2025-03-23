@@ -5,6 +5,7 @@ import cv2
 import logging
 import time
 import numpy as np
+import gc
 from typing import Dict, Optional, List, Tuple, Set
 from contextlib import asynccontextmanager
 from sqlalchemy import select
@@ -27,6 +28,17 @@ class CameraManager:
         self.initialized = False
         self._connection_tasks = {}  # Track connection tasks to avoid duplicates
         self._background_task = None  # Background task for monitoring all cameras
+        
+        # Memory usage limits
+        self.max_cameras = 10  # Max cameras to process simultaneously
+        self.active_cameras = 0  # Number of currently active cameras
+        
+        # Cache for JPEG frames to reduce CPU usage
+        self.frame_cache = {}  # {camera_id: {"frame": jpeg_bytes, "timestamp": time}}
+        self.cache_expiry = 1.0  # Cache frames for 1 second
+        
+        # Set the OpenCV thread count
+        cv2.setNumThreads(4)  # Limit OpenCV to 4 threads
     
     async def initialize(self):
         """Initialize camera manager and start background processing for all enabled cameras"""
@@ -51,12 +63,51 @@ class CameraManager:
                     result = await session.execute(query)
                     enabled_cameras = result.scalars().all()
                     
-                    # Ensure all enabled cameras are added to manager and being processed
+                    # Count active cameras
+                    self.active_cameras = sum(1 for processor in self.cameras.values() if processor.processing)
+                    logger.info(f"Currently processing {self.active_cameras} cameras")
+                    
+                    # Sort cameras by priority (those in use first)
+                    priority_cameras = []
+                    regular_cameras = []
+                    
                     for camera in enabled_cameras:
+                        if camera.id in self.cameras_in_use:
+                            priority_cameras.append(camera)
+                        else:
+                            regular_cameras.append(camera)
+                    
+                    # Process priority cameras first, then regular cameras up to the limit
+                    all_cameras = priority_cameras + regular_cameras
+                    
+                    # Check if we need to remove some cameras due to resource limits
+                    if len(all_cameras) > self.max_cameras:
+                        logger.warning(f"Too many cameras enabled ({len(all_cameras)}), limiting to {self.max_cameras}")
+                        # Keep only priority cameras and up to max_cameras total
+                        cameras_to_keep = set(camera.id for camera in all_cameras[:self.max_cameras])
+                        
+                        # Identify cameras to remove
+                        for camera_id in list(self.cameras.keys()):
+                            if camera_id not in cameras_to_keep and camera_id not in self.cameras_in_use:
+                                await self.remove_camera(camera_id)
+                    
+                    # Ensure all priority cameras are added and processed
+                    for camera in priority_cameras:
                         if camera.id not in self.cameras:
                             await self.add_camera(camera, start_processing=True)
                         elif self.cameras[camera.id].should_process and not self.cameras[camera.id].processing:
-                            # Start processing if it's not already running
+                            processor = self.cameras[camera.id]
+                            if not processor.connected:
+                                await processor.connect()
+                            if not processor.processing:
+                                asyncio.create_task(processor.process_stream())
+                    
+                    # Add regular cameras up to the limit
+                    remaining_slots = self.max_cameras - self.active_cameras
+                    for camera in regular_cameras[:remaining_slots]:
+                        if camera.id not in self.cameras:
+                            await self.add_camera(camera, start_processing=True)
+                        elif self.cameras[camera.id].should_process and not self.cameras[camera.id].processing:
                             processor = self.cameras[camera.id]
                             if not processor.connected:
                                 await processor.connect()
@@ -71,12 +122,30 @@ class CameraManager:
                     for camera_id in disabled_ids:
                         if camera_id not in self.cameras_in_use:  # Don't remove cameras currently being viewed
                             await self.remove_camera(camera_id)
+                
+                # Clean expired entries from frame cache
+                self._clean_frame_cache()
+                
+                # Run garbage collection periodically
+                gc.collect()
             
             except Exception as e:
                 logger.exception(f"Error in background monitor task: {str(e)}")
             
             # Check every 60 seconds
             await asyncio.sleep(60)
+    
+    def _clean_frame_cache(self):
+        """Remove expired entries from the frame cache"""
+        now = time.time()
+        expired_keys = []
+        
+        for camera_id, cache_entry in self.frame_cache.items():
+            if now - cache_entry["timestamp"] > self.cache_expiry:
+                expired_keys.append(camera_id)
+        
+        for key in expired_keys:
+            del self.frame_cache[key]
     
     async def add_camera(self, camera: Camera, start_processing: bool = False) -> bool:
         """Add a new camera - connect and start processing if requested"""
@@ -86,6 +155,13 @@ class CameraManager:
             
         async with self.lock:
             camera_id = camera.id
+            
+            # Check resource limits
+            if camera_id not in self.cameras and self.active_cameras >= self.max_cameras:
+                logger.warning(f"Cannot add camera {camera_id}: resource limit reached ({self.active_cameras}/{self.max_cameras})")
+                # Only add if this camera is actively being viewed
+                if camera_id not in self.cameras_in_use:
+                    return False
             
             # If we already have a connection task in progress, wait for it
             if camera_id in self._connection_tasks and not self._connection_tasks[camera_id].done():
@@ -114,6 +190,7 @@ class CameraManager:
                     if not processor.connected:
                         await processor.connect()
                     asyncio.create_task(processor.process_stream())
+                    self.active_cameras += 1
                 
                 return True
                 
@@ -143,6 +220,8 @@ class CameraManager:
                     success = await self._connection_tasks[camera_id]
                     if success:
                         logger.info(f"Added and connected camera {camera_id} ({camera.name})")
+                        if processor.processing:
+                            self.active_cameras += 1
                     else:
                         logger.error(f"Failed to connect to camera {camera_id} ({camera.name})")
                     return success
@@ -211,6 +290,14 @@ class CameraManager:
         """Mark a camera as no longer in use - may stop streaming but continue processing"""
         if camera_id in self.cameras_in_use:
             self.cameras_in_use.remove(camera_id)
+            
+            # If this camera is not actively viewed by anyone, we can stop processing
+            # to save resources if we're at the resource limit
+            if self.active_cameras >= self.max_cameras and camera_id in self.cameras:
+                processor = self.cameras[camera_id]
+                if processor.processing:
+                    processor.processing = False
+                    self.active_cameras -= 1
     
     async def remove_camera(self, camera_id: int) -> bool:
         """Remove a camera and stop its stream processing"""
@@ -226,12 +313,23 @@ class CameraManager:
                 
                 # Disconnect processor
                 try:
+                    # Check if camera was active before disconnecting
+                    was_active = self.cameras[camera_id].processing
+                    
                     await self.cameras[camera_id].disconnect()
                     del self.cameras[camera_id]
                     
                     # Remove from in-use set if present
                     if camera_id in self.cameras_in_use:
                         self.cameras_in_use.remove(camera_id)
+                    
+                    # Update active camera count
+                    if was_active:
+                        self.active_cameras -= 1
+                    
+                    # Remove from frame cache
+                    if camera_id in self.frame_cache:
+                        del self.frame_cache[camera_id]
                     
                     logger.info(f"Removed camera {camera_id}")
                     return True
@@ -255,7 +353,13 @@ class CameraManager:
     
     async def get_jpeg_frame(self, camera_id: int, high_quality: bool = False) -> Optional[bytes]:
         """Get the latest frame as JPEG bytes, with optional high quality"""
-        logger.debug(f"Request for JPEG frame from camera {camera_id}, high quality: {high_quality}")
+        # Check cache first for low quality requests
+        if not high_quality and camera_id in self.frame_cache:
+            cache_entry = self.frame_cache[camera_id]
+            # If cache is still valid, return it
+            if time.time() - cache_entry["timestamp"] <= self.cache_expiry:
+                logger.debug(f"Returning cached JPEG frame for camera {camera_id}")
+                return cache_entry["frame"]
         
         # Ensure camera is connected
         if not await self.ensure_camera_connected(camera_id):
@@ -272,7 +376,16 @@ class CameraManager:
                 encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), 95 if high_quality else 80]
                 
                 _, jpeg = cv2.imencode(".jpg", frame, encode_params)
-                return jpeg.tobytes()
+                jpeg_bytes = jpeg.tobytes()
+                
+                # Cache the result for low quality requests
+                if not high_quality:
+                    self.frame_cache[camera_id] = {
+                        "frame": jpeg_bytes,
+                        "timestamp": time.time()
+                    }
+                
+                return jpeg_bytes
             else:
                 logger.warning(f"No frame data available for camera {camera_id}")
                 return None
@@ -340,6 +453,11 @@ class CameraManager:
             self.cameras.clear()
             self.cameras_in_use.clear()
             self._connection_tasks.clear()
+            self.frame_cache.clear()
+            
+            # Force garbage collection
+            gc.collect()
+            
             logger.info("Camera Manager shutdown completed")
 
 # Singleton instance

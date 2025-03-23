@@ -26,13 +26,16 @@ const CameraDetail: React.FC = () => {
   const [isTemplateModalOpen, setIsTemplateModalOpen] = useState(false);
   const [selectedTemplate, setSelectedTemplate] = useState<Template | null>(null);
   const [streamActive, setStreamActive] = useState(false);
-  const [cameraStatus, setCameraStatus] = useState(null);
+  const [cameraStatus, setCameraStatus] = useState<any>(null);
 
   // Reference to track if the component is mounted
   const isMounted = useRef(true);
   
   // Track status polling interval
-  const statusPollingInterval = useRef<number | null>(null);
+  const statusPollingInterval = useRef<NodeJS.Timeout | null>(null);
+  
+  // Track status polling requests
+  const statusRequestInProgress = useRef(false);
   
   // Load camera details - with stable reference to prevent re-fetching
   const cameraIdRef = useRef(cameraId);
@@ -67,6 +70,24 @@ const CameraDetail: React.FC = () => {
     }
   );
 
+  // Function to fetch camera status with debouncing
+  const fetchCameraStatus = useCallback(async () => {
+    if (!isMounted.current || statusRequestInProgress.current || !streamActive) return;
+    
+    statusRequestInProgress.current = true;
+    
+    try {
+      const status = await getCameraStatus(cameraId);
+      if (isMounted.current) {
+        setCameraStatus(status);
+      }
+    } catch (error) {
+      console.error('Error fetching camera status:', error);
+    } finally {
+      statusRequestInProgress.current = false;
+    }
+  }, [cameraId, streamActive]);
+
   // Function to handle stream connection state
   const handleStreamConnection = useCallback((active: boolean) => {
     console.log(`Stream connection state changed: ${active ? 'connected' : 'disconnected'}`);
@@ -75,31 +96,20 @@ const CameraDetail: React.FC = () => {
     
     // When stream becomes active, start polling for status
     if (active && !statusPollingInterval.current) {
-      const fetchStatus = async () => {
-        if (!isMounted.current) return;
-        
-        try {
-          const status = await getCameraStatus(cameraId);
-          if (isMounted.current) {
-            setCameraStatus(status);
-          }
-        } catch (error) {
-          console.error('Error fetching camera status:', error);
-        }
-      };
-      
-      // Fetch immediately
-      fetchStatus();
+      // First fetch immediately
+      fetchCameraStatus();
       
       // Set up interval - 5 second interval to avoid excessive requests
-      statusPollingInterval.current = window.setInterval(fetchStatus, 5000);
+      statusPollingInterval.current = setInterval(() => {
+        fetchCameraStatus();
+      }, 5000);
     } 
     // When stream becomes inactive, stop polling
     else if (!active && statusPollingInterval.current) {
-      window.clearInterval(statusPollingInterval.current);
+      clearInterval(statusPollingInterval.current);
       statusPollingInterval.current = null;
     }
-  }, [cameraId]);
+  }, [fetchCameraStatus]);
   
   // Load camera details once on mount
   useEffect(() => {
@@ -113,7 +123,7 @@ const CameraDetail: React.FC = () => {
       
       // Clear status polling interval
       if (statusPollingInterval.current) {
-        window.clearInterval(statusPollingInterval.current);
+        clearInterval(statusPollingInterval.current);
         statusPollingInterval.current = null;
       }
     };

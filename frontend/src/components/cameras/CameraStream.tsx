@@ -1,5 +1,5 @@
 // src/components/cameras/CameraStream.tsx
-import React from 'react';
+import React, { memo } from 'react';
 import WebRTCStream from './WebRTCStream';
 
 interface CameraStreamProps {
@@ -7,13 +7,16 @@ interface CameraStreamProps {
   showControls?: boolean;
   height?: string;
   width?: string;
+  onConnectionChange?: (connected: boolean) => void;
 }
 
-const CameraStream: React.FC<CameraStreamProps> = ({
+// Using memo to prevent unnecessary renders
+const CameraStream: React.FC<CameraStreamProps> = memo(({
   cameraId,
   showControls = true,
   height = 'h-72',
   width = 'w-full',
+  onConnectionChange
 }) => {
   // This is now a wrapper that uses WebRTCStream underneath
   // This helps maintain backward compatibility with components that use CameraStream
@@ -23,8 +26,11 @@ const CameraStream: React.FC<CameraStreamProps> = ({
       showControls={showControls}
       height={height}
       width={width}
+      onConnectionChange={onConnectionChange}
     />
   );
-};
+});
+
+CameraStream.displayName = 'CameraStream';
 
 export default CameraStream;

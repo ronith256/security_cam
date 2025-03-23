@@ -1,5 +1,5 @@
 // frontend/src/components/cameras/CameraList.tsx
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { Camera as CameraType } from '../../types/camera';
 import CameraCard from './CameraCard';
 import Loader from '../common/Loader';
@@ -19,47 +19,59 @@ const CameraList: React.FC<CameraListProps> = ({
   const [cameras, setCameras] = useState<CameraType[]>([]);
   const [activeCameras, setActiveCameras] = useState<Set<number>>(new Set());
   const isFirstRender = useRef(true);
+  const isMounted = useRef(true);
   
+  // Stable API function reference
   const { execute: loadCameras, isLoading, error } = useApi(fetchCameras, {
     onSuccess: (data) => {
-      setCameras(data);
+      if (isMounted.current) {
+        setCameras(data);
+      }
     },
   });
 
+  // Load cameras only once on first render
   useEffect(() => {
+    isMounted.current = true;
+    
     if (isFirstRender.current) {
       loadCameras();
       isFirstRender.current = false;
     }
+    
+    return () => {
+      isMounted.current = false;
+    };
   }, [loadCameras]);
 
   // Notify parent component when active camera count changes
   useEffect(() => {
-    if (onActiveChange) {
+    if (onActiveChange && isMounted.current) {
       onActiveChange(activeCameras.size);
     }
   }, [activeCameras, onActiveChange]);
 
-  const handleDelete = (id: number) => {
+  // Stable handler functions
+  const handleDelete = useCallback((id: number) => {
     setCameras((prevCameras) => prevCameras.filter((camera) => camera.id !== id));
     
     // Remove from active cameras if present
-    if (activeCameras.has(id)) {
-      const newActiveCameras = new Set(activeCameras);
-      newActiveCameras.delete(id);
-      setActiveCameras(newActiveCameras);
-    }
-  };
+    setActiveCameras(prev => {
+      const newSet = new Set(prev);
+      newSet.delete(id);
+      return newSet;
+    });
+  }, []);
 
-  const handleUpdate = (updatedCamera: CameraType) => {
+  const handleUpdate = useCallback((updatedCamera: CameraType) => {
     setCameras((prevCameras) =>
       prevCameras.map((camera) =>
         camera.id === updatedCamera.id ? updatedCamera : camera
       )
     );
-  };
+  }, []);
   
-  const handleCameraConnectionChange = (id: number, isConnected: boolean) => {
+  const handleCameraConnectionChange = useCallback((id: number, isConnected: boolean) => {
     setActiveCameras(prev => {
       const newSet = new Set(prev);
       if (isConnected) {
@@ -69,7 +81,7 @@ const CameraList: React.FC<CameraListProps> = ({
       }
       return newSet;
     });
-  };
+  }, []);
 
   // Apply filter if provided
   const filteredCameras = filter ? cameras.filter(filter) : cameras;
@@ -106,7 +118,7 @@ const CameraList: React.FC<CameraListProps> = ({
           camera={camera}
           onDelete={handleDelete}
           onUpdate={handleUpdate}
-          onConnectionChange={(isConnected) => handleCameraConnectionChange(camera.id, isConnected)}
+          onConnectionChange={handleCameraConnectionChange}
         />
       ))}
     </div>

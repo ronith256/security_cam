@@ -55,6 +55,9 @@ const WebRTCStream: React.FC<WebRTCStreamProps> = ({
   // To track component mount state
   const isMounted = useRef(true);
   
+  // Track active connection to prevent multiple connection attempts
+  const isConnectingRef = useRef<boolean>(false);
+  
   // Track if connection change callback has been called
   const connectionNotifiedRef = useRef<boolean | null>(null);
 
@@ -110,8 +113,17 @@ const WebRTCStream: React.FC<WebRTCStreamProps> = ({
     
     // Stop video playback
     if (videoRef.current) {
+      if (videoRef.current.srcObject) {
+        const mediaStream = videoRef.current.srcObject as MediaStream;
+        if (mediaStream) {
+          mediaStream.getTracks().forEach(track => track.stop());
+        }
+      }
       videoRef.current.srcObject = null;
     }
+    
+    // Reset connection state
+    isConnectingRef.current = false;
   }, []);
   
   // Function to toggle fullscreen mode
@@ -156,13 +168,25 @@ const WebRTCStream: React.FC<WebRTCStreamProps> = ({
   
   // Connect using WebRTC
   const connectWebRTC = useCallback(async () => {
-    if (!isMounted.current) return;
+    // Prevent multiple simultaneous connection attempts
+    if (isConnectingRef.current || !isMounted.current) return;
     
+    isConnectingRef.current = true;
     setIsLoading(true);
     setError(null);
     
     try {
       console.log(`Setting up WebRTC connection for camera ${cameraIdRef.current}`);
+      
+      // Clean up any existing connection first
+      if (peerConnectionRef.current) {
+        try {
+          peerConnectionRef.current.close();
+        } catch (e) {
+          console.error('Error closing existing peer connection:', e);
+        }
+        peerConnectionRef.current = null;
+      }
       
       // Create peer connection with STUN server config
       const pc = new RTCPeerConnection({
@@ -199,15 +223,21 @@ const WebRTCStream: React.FC<WebRTCStreamProps> = ({
           setIsLoading(false);
           connectionAttemptRef.current = 0;
           notifyConnectionChange(true);
+          isConnectingRef.current = false;
         } else if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected' || pc.connectionState === 'closed') {
           setIsConnected(false);
           notifyConnectionChange(false);
+          isConnectingRef.current = false;
           
           // Attempt to reconnect with exponential backoff
-          if (connectionAttemptRef.current < 5) {
+          if (isMounted.current && connectionAttemptRef.current < 5) {
             connectionAttemptRef.current += 1;
             const delay = Math.min(1000 * Math.pow(2, connectionAttemptRef.current), 30000);
             console.log(`WebRTC connection failed. Will attempt reconnection in ${delay}ms (attempt ${connectionAttemptRef.current})`);
+            
+            if (reconnectTimeoutRef.current) {
+              clearTimeout(reconnectTimeoutRef.current);
+            }
             
             reconnectTimeoutRef.current = setTimeout(() => {
               if (isMounted.current) {
@@ -215,7 +245,7 @@ const WebRTCStream: React.FC<WebRTCStreamProps> = ({
                 connectWebRTC();
               }
             }, delay);
-          } else {
+          } else if (isMounted.current) {
             setError(new Error('Failed to establish a stable WebRTC connection'));
           }
         }
@@ -262,6 +292,7 @@ const WebRTCStream: React.FC<WebRTCStreamProps> = ({
       setError(err instanceof Error ? err : new Error('Failed to establish WebRTC connection'));
       setIsLoading(false);
       notifyConnectionChange(false);
+      isConnectingRef.current = false;
       
       // Clean up failed connection
       if (peerConnectionRef.current) {
@@ -272,11 +303,34 @@ const WebRTCStream: React.FC<WebRTCStreamProps> = ({
         }
         peerConnectionRef.current = null;
       }
+      
+      // Attempt reconnection with exponential backoff
+      if (isMounted.current && connectionAttemptRef.current < 5) {
+        connectionAttemptRef.current += 1;
+        const delay = Math.min(1000 * Math.pow(2, connectionAttemptRef.current), 30000);
+        console.log(`WebRTC connection failed. Will attempt reconnection in ${delay}ms (attempt ${connectionAttemptRef.current})`);
+        
+        if (reconnectTimeoutRef.current) {
+          clearTimeout(reconnectTimeoutRef.current);
+        }
+        
+        reconnectTimeoutRef.current = setTimeout(() => {
+          if (isMounted.current) {
+            reconnectTimeoutRef.current = null;
+            connectWebRTC();
+          }
+        }, delay);
+      }
     }
   }, [notifyConnectionChange]);
   
   // Connect using WebSocket for snapshots
   const connectWebSocket = useCallback(() => {
+    // Prevent multiple simultaneous connection attempts
+    if (isConnectingRef.current || !isMounted.current) return;
+    
+    isConnectingRef.current = true;
+    
     // Clean up existing connection first
     if (wsRef.current) {
       if (wsRef.current.pingInterval) {
@@ -296,10 +350,6 @@ const WebRTCStream: React.FC<WebRTCStreamProps> = ({
     }
     
     if (!isMounted.current) return;
-    
-    // Increment connection attempt counter
-    connectionAttemptRef.current += 1;
-    const currentAttempt = connectionAttemptRef.current;
     
     setIsLoading(true);
     setError(null);
@@ -327,6 +377,7 @@ const WebRTCStream: React.FC<WebRTCStreamProps> = ({
         setIsConnected(true);
         setIsLoading(false);
         connectionAttemptRef.current = 0; // Reset counter on successful connection
+        isConnectingRef.current = false;
         
         // Set up ping interval to keep the connection alive
         ws.pingInterval = setInterval(() => {
@@ -375,14 +426,20 @@ const WebRTCStream: React.FC<WebRTCStreamProps> = ({
         setError(new Error('Failed to connect to snapshot stream'));
         setIsConnected(false);
         setIsLoading(false);
+        isConnectingRef.current = false;
         
         // Notify parent about disconnection
         notifyConnectionChange(false);
         
         // Attempt to reconnect with exponential backoff
-        if (currentAttempt === connectionAttemptRef.current && connectionAttemptRef.current < 5) {
+        if (isMounted.current && connectionAttemptRef.current < 5) {
+          connectionAttemptRef.current += 1;
           const delay = Math.min(1000 * Math.pow(2, connectionAttemptRef.current), 30000);
           console.log(`Will attempt reconnection in ${delay}ms (attempt ${connectionAttemptRef.current})`);
+          
+          if (reconnectTimeoutRef.current) {
+            clearTimeout(reconnectTimeoutRef.current);
+          }
           
           reconnectTimeoutRef.current = setTimeout(() => {
             if (isMounted.current) {
@@ -399,6 +456,7 @@ const WebRTCStream: React.FC<WebRTCStreamProps> = ({
         console.log('WebSocket closed:', event.code, event.reason);
         setIsConnected(false);
         setIsLoading(false);
+        isConnectingRef.current = false;
         
         // Clean up ping interval
         if (ws.pingInterval) {
@@ -411,11 +469,15 @@ const WebRTCStream: React.FC<WebRTCStreamProps> = ({
         
         // Attempt to reconnect with exponential backoff if not closed cleanly
         if (event.code !== 1000 && event.code !== 1001 && 
-            currentAttempt === connectionAttemptRef.current && 
-            connectionAttemptRef.current < 5) {
+            isMounted.current && connectionAttemptRef.current < 5) {
           
+          connectionAttemptRef.current += 1;
           const delay = Math.min(1000 * Math.pow(2, connectionAttemptRef.current), 30000);
           console.log(`WebSocket closed. Will attempt reconnection in ${delay}ms (attempt ${connectionAttemptRef.current})`);
+          
+          if (reconnectTimeoutRef.current) {
+            clearTimeout(reconnectTimeoutRef.current);
+          }
           
           reconnectTimeoutRef.current = setTimeout(() => {
             if (isMounted.current) {
@@ -431,6 +493,7 @@ const WebRTCStream: React.FC<WebRTCStreamProps> = ({
       console.error('Error setting up WebSocket:', err);
       setError(err instanceof Error ? err : new Error('Failed to connect to snapshot stream'));
       setIsLoading(false);
+      isConnectingRef.current = false;
       
       // Notify parent about connection failure
       notifyConnectionChange(false);
@@ -497,10 +560,19 @@ const WebRTCStream: React.FC<WebRTCStreamProps> = ({
     };
   }, []);
   
-  // Connection logic based on current mode
+  // Connection logic based on current mode - with proper cleanup and state tracking
   useEffect(() => {
     // Set isMounted to true
     isMounted.current = true;
+    
+    // Clear any existing connection attempts first
+    cleanupResources();
+    
+    // Reset connection state
+    connectionAttemptRef.current = 0;
+    setIsConnected(false);
+    setIsLoading(true);
+    setError(null);
     
     console.log(`Initializing camera stream for camera ${cameraId} in ${streamMode} mode`);
     
@@ -522,7 +594,7 @@ const WebRTCStream: React.FC<WebRTCStreamProps> = ({
     };
   }, [cameraId, streamMode, connectWebRTC, connectWebSocket, cleanupResources, notifyConnectionChange]);
   
-  // Switch mode if highQuality prop changes
+  // Switch mode if highQuality prop changes, but only once on init or when it changes
   useEffect(() => {
     const newMode = highQuality ? StreamMode.WEBRTC : StreamMode.SNAPSHOT;
     if (newMode !== streamMode) {
@@ -530,13 +602,18 @@ const WebRTCStream: React.FC<WebRTCStreamProps> = ({
     }
   }, [highQuality, streamMode]);
   
-  // Manual reconnect
+  // Manual reconnect - fully cleanup first
   const handleReconnect = useCallback(() => {
     // Reset connection attempts
     connectionAttemptRef.current = 0;
     
     // Clean up existing connections
     cleanupResources();
+    
+    // Reset state
+    setIsConnected(false);
+    setIsLoading(true);
+    setError(null);
     
     // Connect based on current mode
     if (streamMode === StreamMode.WEBRTC) {

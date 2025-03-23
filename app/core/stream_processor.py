@@ -3,6 +3,7 @@ import asyncio
 import time
 import logging
 import numpy as np
+import gc
 from typing import Dict, Optional, List, Tuple, Any
 from datetime import datetime
 from app.config import settings
@@ -45,7 +46,7 @@ class StreamProcessor:
         self.connected = False
         self.processing = False
         
-        # Frame buffer
+        # Frame buffer (with size limit)
         self.latest_frame = None
         self.latest_processed_frame = None
         self.last_frame_time = 0
@@ -74,6 +75,11 @@ class StreamProcessor:
         
         # Locks
         self.frame_lock = asyncio.Lock()
+        
+        # Memory management
+        self.max_frame_size = (1280, 720)  # Max resolution to process
+        self.max_frames_without_gc = 100  # Run garbage collection after this many frames
+        self.frames_since_gc = 0
     
     async def connect(self) -> bool:
         """Connect to the RTSP stream"""
@@ -105,17 +111,17 @@ class StreamProcessor:
             # Set buffer size to reduce latency
             self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             
-            # Initialize AI components if needed
-            if self.detect_people or self.count_people:
+            # Initialize AI components if needed - lazy initialization to save memory
+            if (self.detect_people or self.count_people) and self.object_detector is None:
                 self.object_detector = ObjectDetector()
             
-            if self.count_people:
+            if self.count_people and self.people_counter is None:
                 self.people_counter = PeopleCounter(camera_id=self.camera_id)
             
-            if self.recognize_faces:
+            if self.recognize_faces and self.face_recognizer is None:
                 self.face_recognizer = FaceRecognizer()
             
-            if self.template_matching:
+            if self.template_matching and self.template_matcher is None:
                 self.template_matcher = TemplateMatcher(camera_id=self.camera_id)
             
             self.connected = True
@@ -140,14 +146,23 @@ class StreamProcessor:
             await loop.run_in_executor(None, lambda: self.cap.release())
             self.cap = None
         
+        # Clear frame buffers to free memory
+        self.latest_frame = None
+        self.latest_processed_frame = None
+        
+        # Run garbage collection
+        gc.collect()
+        
         logger.info(f"Disconnected from camera {self.camera_id}")
     
     def set_base_template(self, frame: np.ndarray):
         """Set the base template for scene change detection"""
-        # Convert to grayscale and resize for faster comparison
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        resized = cv2.resize(gray, (320, 240))  # Lower resolution for comparison
-        self.base_template = resized
+        # Resize for faster comparison and lower memory usage
+        small_frame = cv2.resize(frame, (320, 240))
+        
+        # Convert to grayscale for smaller memory footprint
+        gray = cv2.cvtColor(small_frame, cv2.COLOR_BGR2GRAY)
+        self.base_template = gray
         self.last_template_update = time.time()
         logger.info(f"Updated base template for camera {self.camera_id}")
     
@@ -162,18 +177,42 @@ class StreamProcessor:
             self.set_base_template(frame)
             return True
         
-        # Convert to grayscale and resize to match template
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        resized = cv2.resize(gray, (320, 240))
+        # Resize for faster comparison
+        small_frame = cv2.resize(frame, (320, 240))
+        
+        # Convert to grayscale
+        gray = cv2.cvtColor(small_frame, cv2.COLOR_BGR2GRAY)
         
         # Calculate Mean Absolute Difference (MAD)
-        diff = cv2.absdiff(resized, self.base_template)
+        diff = cv2.absdiff(gray, self.base_template)
         mean_diff = np.mean(diff) / 255.0  # Normalize to 0-1 range
         
         # If difference exceeds threshold, scene has changed
         changed = mean_diff > self.change_threshold
         
         return changed
+    
+    def _limit_frame_size(self, frame: np.ndarray) -> np.ndarray:
+        """Limit frame size to reduce memory usage"""
+        if frame is None:
+            return None
+            
+        h, w = frame.shape[:2]
+        max_w, max_h = self.max_frame_size
+        
+        if w > max_w or h > max_h:
+            # Calculate new dimensions maintaining aspect ratio
+            if w/h > max_w/max_h:  # Width limited
+                new_w = max_w
+                new_h = int(h * (max_w / w))
+            else:  # Height limited
+                new_h = max_h
+                new_w = int(w * (max_h / h))
+                
+            # Resize frame
+            return cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        
+        return frame
     
     async def process_stream(self):
         """Main processing loop for the video stream"""
@@ -205,8 +244,13 @@ class StreamProcessor:
                     await asyncio.sleep(1)  # Wait before trying again
                     continue
                 
+                # Limit frame size to reduce memory usage
+                frame = self._limit_frame_size(frame)
+                
                 # Update the latest frame
                 async with self.frame_lock:
+                    # Clear old frame before assigning new one to prevent memory leaks
+                    self.latest_frame = None
                     self.latest_frame = frame.copy()
                     self.last_frame_time = time.time()
                 
@@ -228,6 +272,8 @@ class StreamProcessor:
                         
                         # Update the latest processed frame
                         async with self.frame_lock:
+                            # Clear old frame before assigning new one
+                            self.latest_processed_frame = None
                             self.latest_processed_frame = processed_frame
                             self.last_processed_time = time.time()
                             last_process_time = time.time()
@@ -250,6 +296,8 @@ class StreamProcessor:
                         )
                         
                         async with self.frame_lock:
+                            # Clear old frame before assigning new one
+                            self.latest_processed_frame = None
                             self.latest_processed_frame = minimal_processed
                         
                         frames_skipped += 1
@@ -261,6 +309,12 @@ class StreamProcessor:
                     logger.debug(f"Camera {self.camera_id} processing FPS: {self.fps:.2f}")
                     self.frame_count = 0
                     self.last_fps_update = time.time()
+                
+                # Periodic garbage collection to prevent memory leaks
+                self.frames_since_gc += 1
+                if self.frames_since_gc >= self.max_frames_without_gc:
+                    gc.collect()
+                    self.frames_since_gc = 0
                 
                 # Log stats every 100 frames
                 if (frames_processed + frames_skipped) % 100 == 0:
@@ -445,8 +499,9 @@ class StreamProcessor:
             # Disconnect first
             await self.disconnect()
             
-            # Wait before retry
-            await asyncio.sleep(2)
+            # Wait before retry with exponential backoff
+            wait_time = min(2 ** attempt, 30)  # Max 30 seconds
+            await asyncio.sleep(wait_time)
             
             # Try to connect again
             if await self.connect():

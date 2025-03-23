@@ -1,11 +1,10 @@
 // src/components/faces/FaceDetections.tsx
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import Card from '../common/Card';
 import Loader from '../common/Loader';
 import { useApi } from '../../hooks/useApi';
 import { getFaceDetections } from '../../api/faceRecognition';
 import { FaceDetection } from '../../types/person';
-import { useInterval } from '../../hooks/useInterval';
 import { AlertCircle, RefreshCw, User } from 'lucide-react';
 import Button from '../common/Button';
 
@@ -16,40 +15,97 @@ interface FaceDetectionsProps {
 
 const FaceDetections: React.FC<FaceDetectionsProps> = ({ 
   cameraId,
-  pollInterval = 5000 // 5 seconds
+  pollInterval = 10000 // Increased to 10 seconds
 }) => {
   const [faces, setFaces] = useState<FaceDetection[]>([]);
   const [isPolling, setIsPolling] = useState(true);
   
-  const { execute: loadFaces, isLoading, error } = useApi(
-    () => getFaceDetections(cameraId),
-    {
-      onSuccess: (data) => {
-        setFaces(data);
-      },
-      showErrorToast: false,
-    }
-  );
-
-  // Initial load
-  useEffect(() => {
-    loadFaces();
-  }, [loadFaces]);
+  // Track component mounted state
+  const isMounted = useRef(true);
   
-  // Set up polling
-  useInterval(() => {
+  // Track polling interval
+  const pollingIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  
+  // Track if a request is in progress
+  const requestInProgressRef = useRef(false);
+  
+  // Use useCallback to create a stable function reference
+  const loadFaces = useCallback(async () => {
+    // Skip if unmounted or request in progress or polling disabled
+    if (!isMounted.current || requestInProgressRef.current || !isPolling) return;
+    
+    // Mark request as in progress
+    requestInProgressRef.current = true;
+    
+    try {
+      const data = await getFaceDetections(cameraId);
+      if (isMounted.current) {
+        setFaces(data);
+      }
+    } catch (error) {
+      console.error('Error loading face detections:', error);
+    } finally {
+      requestInProgressRef.current = false;
+    }
+  }, [cameraId, isPolling]);
+
+  // Set up and clean up polling
+  useEffect(() => {
+    isMounted.current = true;
+    
+    // Load initially
+    loadFaces();
+    
+    // Set up polling if enabled
     if (isPolling) {
+      pollingIntervalRef.current = setInterval(loadFaces, pollInterval);
+    }
+    
+    // Cleanup function
+    return () => {
+      isMounted.current = false;
+      
+      // Clear interval if it exists
+      if (pollingIntervalRef.current) {
+        clearInterval(pollingIntervalRef.current);
+        pollingIntervalRef.current = null;
+      }
+    };
+  }, [loadFaces, isPolling, pollInterval]);
+
+  // Handle toggling polling on/off
+  const togglePolling = useCallback(() => {
+    setIsPolling(prev => {
+      // If turning on, set up interval
+      if (!prev) {
+        // Clear any existing interval first
+        if (pollingIntervalRef.current) {
+          clearInterval(pollingIntervalRef.current);
+        }
+        
+        // Create new interval
+        pollingIntervalRef.current = setInterval(loadFaces, pollInterval);
+        
+        // Immediately load data
+        loadFaces();
+      } 
+      // If turning off, clear interval
+      else if (pollingIntervalRef.current) {
+        clearInterval(pollingIntervalRef.current);
+        pollingIntervalRef.current = null;
+      }
+      
+      return !prev;
+    });
+  }, [loadFaces, pollInterval]);
+
+  // Manual refresh function
+  const refresh = useCallback(() => {
+    // Only if not already in progress
+    if (!requestInProgressRef.current) {
       loadFaces();
     }
-  }, pollInterval);
-
-  const togglePolling = () => {
-    setIsPolling(!isPolling);
-  };
-
-  const refresh = () => {
-    loadFaces();
-  };
+  }, [loadFaces]);
 
   return (
     <Card
@@ -77,17 +133,9 @@ const FaceDetections: React.FC<FaceDetectionsProps> = ({
       }
     >
       <div className="flex-grow">
-        {isLoading && faces.length === 0 ? (
+        {requestInProgressRef.current && faces.length === 0 ? (
           <div className="flex items-center justify-center h-64">
             <Loader text="Loading face detections..." />
-          </div>
-        ) : error && faces.length === 0 ? (
-          <div className="bg-red-50 p-4 rounded-md flex items-start">
-            <AlertCircle className="text-red-500 mr-2 mt-0.5" size={20} />
-            <div>
-              <h3 className="text-red-800 font-medium">Error loading face detections</h3>
-              <p className="text-red-700 text-sm">{error.message}</p>
-            </div>
           </div>
         ) : faces.length === 0 ? (
           <div className="flex flex-col items-center justify-center h-64 bg-gray-50 rounded-md">
