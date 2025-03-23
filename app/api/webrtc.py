@@ -1,6 +1,6 @@
 # app/api/webrtc.py
 
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Depends, HTTPException
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Depends, HTTPException, websockets
 import json
 import asyncio
 import cv2
@@ -97,15 +97,35 @@ class RTSPVideoStreamTrack(MediaStreamTrack):
         self._cache_expiry = 0.1  # 100ms cache validity
         self._last_cache_update = 0
         
+        # Fallback frame if needed (blank frame)
+        self._fallback_frame = None
+        
+        # Create a standard black frame as fallback
+        self._create_fallback_frame()
+        
         # Limit resolution based on high_quality flag
         self._frame_size = (1280, 720) if high_quality else (640, 360)
         
         # Track reference count to avoid memory leaks
-        self._ref_count = 0
+        self._ref_count = 1  # Start with 1 reference
         
         # Start frame capture thread
         self._start_capture_thread()
-    
+
+    def _create_fallback_frame(self):
+        """Create a fallback frame with a text overlay"""
+        width, height = (640, 360)
+        frame = np.zeros((height, width, 3), np.uint8)
+        
+        # Add text overlay
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        text = f"Camera {self.camera_id} - No Stream Available"
+        text_size = cv2.getTextSize(text, font, 1, 2)[0]
+        text_x = (width - text_size[0]) // 2
+        text_y = (height + text_size[1]) // 2
+        cv2.putText(frame, text, (text_x, text_y), font, 1, (255, 255, 255), 2)
+        self._fallback_frame = frame    
+
     def _start_capture_thread(self):
         """Start a thread to capture frames from the camera processor"""
         thread = threading.Thread(target=self._capture_frames_loop, daemon=True)
@@ -133,37 +153,69 @@ class RTSPVideoStreamTrack(MediaStreamTrack):
         finally:
             loop.close()
     
+    def _capture_frames_loop(self):
+        """Background thread to capture frames"""
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        try:
+            while self._running:
+                frame = loop.run_until_complete(self._get_frame())
+                if frame is not None:
+                    with self._lock:
+                        self._current_frame = frame
+                
+                # Limit capture rate to avoid excessive CPU usage
+                # Adjust based on quality - high quality gets more frames
+                capture_interval = 1/30 if self.high_quality else 1/15  # 30 or 15 fps
+                time.sleep(max(0, capture_interval - (time.time() - self._last_frame_time)))
+                self._last_frame_time = time.time()
+        except Exception as e:
+            logger.exception(f"Error in capture thread for camera {self.camera_id}: {str(e)}")
+        finally:
+            loop.close()
+    
     async def _get_frame(self):
         """Get a frame from the camera processor"""
         try:
             camera_manager = await get_camera_manager()
-            jpeg_frame = await camera_manager.get_jpeg_frame(self.camera_id, self.high_quality)
             
-            if jpeg_frame:
-                # Convert JPEG to numpy array
-                nparr = np.frombuffer(jpeg_frame, np.uint8)
-                img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            # First, make sure the camera is connected and processing
+            await camera_manager.ensure_camera_connected(self.camera_id)
+            
+            # Then try to get a frame
+            frame_data = await camera_manager.get_frame(self.camera_id)
+            
+            if frame_data:
+                frame, timestamp = frame_data
                 
                 # Resize to target resolution to control memory usage
-                img = cv2.resize(img, self._frame_size)
+                frame = cv2.resize(frame, self._frame_size)
                 
                 # Add timestamp overlay
-                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                time_stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 cv2.putText(
-                    img,
-                    timestamp,
-                    (10, img.shape[0] - 10),
+                    frame,
+                    time_stamp,
+                    (10, frame.shape[0] - 10),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.7,
                     (255, 255, 255),
                     1
                 )
                 
-                return img
+                return frame
+            else:
+                # If no frame but we have a fallback, use it
+                if self._fallback_frame is not None:
+                    return self._fallback_frame.copy()
         except Exception as e:
             if "No frame data available" not in str(e):  # Don't log expected message
                 logger.error(f"Error getting frame for camera {self.camera_id}: {str(e)}")
         
+        # Return fallback frame if available, otherwise None
+        if self._fallback_frame is not None:
+            return self._fallback_frame.copy()
         return None
     
     async def recv(self):
@@ -185,6 +237,14 @@ class RTSPVideoStreamTrack(MediaStreamTrack):
             pts, time_base = await self.next_timestamp()
             width, height = self._frame_size
             frame = np.zeros((height, width, 3), np.uint8)
+            
+            # Add "No signal" text
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            text = f"Camera {self.camera_id} - No Signal"
+            text_size = cv2.getTextSize(text, font, 1, 2)[0]
+            text_x = (width - text_size[0]) // 2
+            text_y = (height + text_size[1]) // 2
+            cv2.putText(frame, text, (text_x, text_y), font, 1, (255, 255, 255), 2)
         else:
             pts, time_base = await self.next_timestamp()
         
@@ -367,6 +427,14 @@ class WebRTCManager:
         
         # Create/get video track for this camera if needed
         if camera_id not in self.camera_tracks:
+            # Ensure camera is connected and processing
+            camera_manager = await get_camera_manager()
+            connected = await camera_manager.ensure_camera_connected(camera_id)
+            
+            if not connected:
+                logger.warning(f"Camera {camera_id} could not be connected, but creating WebRTC track anyway")
+            
+            # Create the track anyway to show a "No Signal" message
             self.camera_tracks[camera_id] = RTSPVideoStreamTrack(camera_id, high_quality=True).add_ref()
         
         # Add track to peer connection
@@ -389,7 +457,7 @@ class WebRTCManager:
                 await self.close_peer_connection(pc, camera_id)
         
         return pc
-    
+        
     async def close_peer_connection(self, pc, camera_id: int):
         """Close a peer connection and clean up resources"""
         # Close the connection
@@ -465,22 +533,72 @@ class WebRTCManager:
         """Send periodic snapshots to all connected clients"""
         camera_manager = await get_camera_manager()
         snapshot_interval = 1  # Send snapshot every second
+        failed_attempts = 0
+        max_failed_attempts = 5
         
         try:
+            # First ensure camera is connected
+            connected = await camera_manager.ensure_camera_connected(camera_id)
+            if not connected:
+                logger.warning(f"Camera {camera_id} could not be connected for snapshots")
+                # Continue anyway to show error message
+            
+            # Main loop
             while camera_id in self.snapshot_connections and self.snapshot_connections[camera_id]:
-                # Get a snapshot from the camera
-                jpeg_frame = await camera_manager.get_jpeg_frame(camera_id, high_quality=False)
-                
-                if jpeg_frame:
-                    # Encode to base64
-                    encoded_frame = base64.b64encode(jpeg_frame).decode('utf-8')
+                try:
+                    # Get a snapshot from the camera
+                    jpeg_frame = await camera_manager.get_jpeg_frame(camera_id, high_quality=False)
                     
-                    # Create snapshot message
-                    message = json.dumps({
-                        "type": "snapshot",
-                        "timestamp": time.time(),
-                        "data": encoded_frame
-                    })
+                    if jpeg_frame:
+                        # Reset failed attempts counter
+                        failed_attempts = 0
+                        
+                        # Encode to base64
+                        encoded_frame = base64.b64encode(jpeg_frame).decode('utf-8')
+                        
+                        # Create snapshot message
+                        message = json.dumps({
+                            "type": "snapshot",
+                            "timestamp": time.time(),
+                            "data": encoded_frame
+                        })
+                        
+                    else:
+                        # Increment failed attempts
+                        failed_attempts += 1
+                        logger.warning(f"No frame available for camera {camera_id}, attempt {failed_attempts}/{max_failed_attempts}")
+                        
+                        if failed_attempts >= max_failed_attempts:
+                            # Create a "No Signal" image
+                            no_signal_img = np.zeros((360, 640, 3), np.uint8)
+                            font = cv2.FONT_HERSHEY_SIMPLEX
+                            text = f"Camera {camera_id} - No Signal"
+                            text_size = cv2.getTextSize(text, font, 1, 2)[0]
+                            text_x = (640 - text_size[0]) // 2
+                            text_y = (360 + text_size[1]) // 2
+                            cv2.putText(no_signal_img, text, (text_x, text_y), font, 1, (255, 255, 255), 2)
+                            
+                            # Convert to JPEG
+                            _, buffer = cv2.imencode('.jpg', no_signal_img)
+                            jpeg_frame = buffer.tobytes()
+                            
+                            # Encode to base64
+                            encoded_frame = base64.b64encode(jpeg_frame).decode('utf-8')
+                            
+                            # Create error message
+                            message = json.dumps({
+                                "type": "snapshot",
+                                "timestamp": time.time(),
+                                "data": encoded_frame,
+                                "error": True
+                            })
+                            
+                            # Reset counter after sending an error frame
+                            failed_attempts = 0
+                        else:
+                            # Skip this iteration, no frame to send
+                            await asyncio.sleep(snapshot_interval)
+                            continue
                     
                     # Send to all connected clients
                     disconnected = []
@@ -494,14 +612,24 @@ class WebRTCManager:
                     # Clean up disconnected clients
                     for client in disconnected:
                         await self.disconnect_snapshot(camera_id, client)
-                
-                # Wait for next snapshot
-                await asyncio.sleep(snapshot_interval)
+                    
+                    # Wait for next snapshot
+                    await asyncio.sleep(snapshot_interval)
+                    
+                except asyncio.CancelledError:
+                    logger.info(f"Snapshot task for camera {camera_id} cancelled")
+                    raise
+                except Exception as e:
+                    logger.exception(f"Error in snapshot task for camera {camera_id}: {str(e)}")
+                    # Brief pause to avoid flooding logs with errors
+                    await asyncio.sleep(1)
+        
         except asyncio.CancelledError:
             logger.info(f"Snapshot task for camera {camera_id} cancelled")
             raise
         except Exception as e:
-            logger.exception(f"Error in snapshot task for camera {camera_id}: {str(e)}")
+            logger.exception(f"Fatal error in snapshot task for camera {camera_id}: {str(e)}")
+
 
 # Create singleton instance
 webrtc_manager = WebRTCManager()
@@ -574,6 +702,12 @@ async def snapshot_endpoint(websocket: WebSocket, camera_id: int):
                     await websocket.send_json({"type": "pong"})
             except json.JSONDecodeError:
                 continue
+            except websockets.exceptions.ConnectionClosedOK:
+                logger.info(f"Snapshot client disconnected normally from camera {camera_id}")
+                break
+            except websockets.exceptions.ConnectionClosedError:
+                logger.info(f"Snapshot client connection error for camera {camera_id}")
+                break
     except WebSocketDisconnect:
         logger.info(f"Snapshot client disconnected from camera {camera_id}")
     except Exception as e:
@@ -591,7 +725,7 @@ async def webrtc_offer(
     sdp = request.get("sdp")
     
     if not camera_id or not sdp:
-        raise HTTPException(status_code=400, detail="Missing cameraId or sdp")
+        raise HTTPException(status_code=400, detail="Missing cameraId or sdp", headers={"Access-Control-Allow-Origin": "*"})
     
     # Check if camera exists and is enabled
     camera_enabled = False
@@ -603,10 +737,18 @@ async def webrtc_offer(
                 break
     except Exception as e:
         logger.error(f"Database error checking camera {camera_id}: {str(e)}")
-        raise HTTPException(status_code=500, detail="Database error")
+        raise HTTPException(status_code=500, detail="Database error", headers={"Access-Control-Allow-Origin": "*"})
     
     if not camera_enabled:
-        raise HTTPException(status_code=404, detail="Camera not found or disabled")
+        raise HTTPException(status_code=404, detail="Camera not found or disabled", headers={"Access-Control-Allow-Origin": "*"})
+    
+    # Ensure camera is connected and processing
+    camera_manager = await get_camera_manager()
+    connected = await camera_manager.ensure_camera_connected(camera_id)
+    
+    if not connected:
+        logger.warning(f"Camera {camera_id} could not be connected for WebRTC")
+        # Continue anyway to allow the WebRTC connection, but warn in the log
     
     # Create peer connection
     pc = await webrtc_manager.create_peer_connection(camera_id)
@@ -635,7 +777,7 @@ async def webrtc_ice_candidate(
     sdpMLineIndex = request.get("sdpMLineIndex")
     
     if not camera_id or not candidate:
-        raise HTTPException(status_code=400, detail="Missing parameters")
+        raise HTTPException(status_code=400, detail="Missing parameters", headers={"Access-Control-Allow-Origin": "*"})
     
     # Find peer connection for this camera
     if camera_id in webrtc_manager.peer_connections:
@@ -671,17 +813,17 @@ async def take_template_snapshot(camera_id: int):
                 break
     except Exception as e:
         logger.error(f"Database error checking camera {camera_id}: {str(e)}")
-        raise HTTPException(status_code=500, detail="Database error")
+        raise HTTPException(status_code=500, detail="Database error", headers={"Access-Control-Allow-Origin": "*"})
     
     if not camera_enabled:
-        raise HTTPException(status_code=404, detail="Camera not found or disabled")
+        raise HTTPException(status_code=404, detail="Camera not found or disabled", headers={"Access-Control-Allow-Origin": "*"})
     
     # Take template snapshot
     camera_manager = await get_camera_manager()
     jpeg_data = await camera_manager.take_template_snapshot(camera_id)
     
     if not jpeg_data:
-        raise HTTPException(status_code=500, detail="Failed to take template snapshot")
+        raise HTTPException(status_code=500, detail="Failed to take template snapshot", headers={"Access-Control-Allow-Origin": "*"})
     
     return {
         "success": True,

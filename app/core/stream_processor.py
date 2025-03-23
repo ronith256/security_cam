@@ -86,24 +86,71 @@ class StreamProcessor:
         try:
             logger.info(f"Attempting to connect to RTSP stream: {self.rtsp_url}")
             
+            # If already connected, disconnect first to ensure a clean state
+            if self.connected and self.cap:
+                logger.info(f"Already connected to {self.rtsp_url}, resetting connection")
+                await self.disconnect()
+                await asyncio.sleep(1)  # Brief pause before reconnecting
+            
+            # Add connection options to improve reliability
+            # In OpenCV, use TCP instead of UDP (preferred for reliability over speed)
+            rtsp_options = {
+                "rtsp_transport": "tcp",  # Use TCP instead of UDP for more reliable connection
+                "buffer_size": "10485760",  # 10MB buffer
+                "max_delay": "500000",    # 0.5 second max delay
+                "stimeout": "5000000"     # 5 second timeout
+            }
+            
+            # Build the RTSP URL with options
+            rtsp_url_with_options = self.rtsp_url
+            if "?" not in rtsp_url_with_options:
+                rtsp_url_with_options += "?"
+            else:
+                rtsp_url_with_options += "&"
+            
+            for key, value in rtsp_options.items():
+                rtsp_url_with_options += f"{key}={value}&"
+            
+            # Remove the last '&'
+            rtsp_url_with_options = rtsp_url_with_options.rstrip("&")
+            
+            logger.info(f"Using RTSP URL with options: {rtsp_url_with_options}")
+            
             # OpenCV VideoCapture is blocking, so run in a thread pool
             loop = asyncio.get_event_loop()
             self.cap = await loop.run_in_executor(
-                None, lambda: cv2.VideoCapture(self.rtsp_url)
+                None, lambda: cv2.VideoCapture(rtsp_url_with_options)
             )
             
             if not self.cap.isOpened():
                 logger.error(f"Failed to open RTSP stream: {self.rtsp_url}")
-                return False
+                
+                # Try again with the original URL if the options didn't work
+                logger.info(f"Retrying with original URL: {self.rtsp_url}")
+                self.cap = await loop.run_in_executor(
+                    None, lambda: cv2.VideoCapture(self.rtsp_url)
+                )
+                
+                if not self.cap.isOpened():
+                    logger.error(f"Still failed to open RTSP stream: {self.rtsp_url}")
+                    return False
             
             # Test read a frame to verify connection
-            success, test_frame = await loop.run_in_executor(None, self.cap.read)
+            for attempt in range(3):  # Try a few times to get a frame
+                logger.info(f"Reading test frame, attempt {attempt+1}/3")
+                success, test_frame = await loop.run_in_executor(None, self.cap.read)
+                if success and test_frame is not None:
+                    logger.info(f"Successfully read test frame from {self.rtsp_url}, dimensions: {test_frame.shape}")
+                    break
+                
+                if attempt < 2:  # Don't sleep on the last attempt
+                    await asyncio.sleep(1)  # Wait a bit before trying again
+            
+            # Final check if we have a valid frame
             if not success or test_frame is None:
                 logger.error(f"Connected to stream {self.rtsp_url} but could not read a frame")
                 return False
                 
-            logger.info(f"Successfully read test frame from {self.rtsp_url}, dimensions: {test_frame.shape}")
-            
             # Store first frame as template if none exists
             if self.base_template is None:
                 self.set_base_template(test_frame)
@@ -220,12 +267,19 @@ class StreamProcessor:
             logger.error(f"Cannot process stream for camera {self.camera_id}: Not connected")
             return
         
+        # Don't start processing if already processing
+        if self.processing:
+            logger.warning(f"Camera {self.camera_id} is already being processed")
+            return
+        
         self.processing = True
         loop = asyncio.get_event_loop()
         frames_processed = 0
         frames_skipped = 0
+        frames_failed = 0  # Track failed frame reads
         processing_start_time = time.time()
         last_process_time = 0
+        consecutive_failures = 0  # Track consecutive frame read failures
         
         try:
             logger.info(f"Starting stream processing for camera {self.camera_id}")
@@ -237,12 +291,28 @@ class StreamProcessor:
                 logger.debug(f"Reading frame from camera {self.camera_id}")
                 ret, frame = await loop.run_in_executor(None, lambda: self.cap.read())
                 
-                if not ret:
-                    logger.warning(f"Failed to read frame from camera {self.camera_id}")
-                    # Try to reconnect
-                    await self.reconnect()
-                    await asyncio.sleep(1)  # Wait before trying again
+                if not ret or frame is None:
+                    frames_failed += 1
+                    consecutive_failures += 1
+                    logger.warning(f"Failed to read frame from camera {self.camera_id} (consecutive failures: {consecutive_failures})")
+                    
+                    # If too many consecutive failures, try to reconnect
+                    if consecutive_failures >= 5:
+                        logger.error(f"Too many consecutive frame read failures ({consecutive_failures}), attempting to reconnect")
+                        # Try to reconnect
+                        reconnect_success = await self.reconnect()
+                        if reconnect_success:
+                            logger.info(f"Successfully reconnected to camera {self.camera_id}")
+                            consecutive_failures = 0  # Reset counter after successful reconnection
+                        else:
+                            logger.error(f"Failed to reconnect to camera {self.camera_id}")
+                    
+                    # Wait before trying again
+                    await asyncio.sleep(1)
                     continue
+                
+                # Reset consecutive failures counter when we successfully read a frame
+                consecutive_failures = 0
                 
                 # Limit frame size to reduce memory usage
                 frame = self._limit_frame_size(frame)
@@ -321,7 +391,7 @@ class StreamProcessor:
                     elapsed = time.time() - processing_start_time
                     logger.info(
                         f"Camera {self.camera_id}: Processed {frames_processed} frames, "
-                        f"skipped {frames_skipped} frames in {elapsed:.2f}s "
+                        f"skipped {frames_skipped} frames, failed {frames_failed} frames in {elapsed:.2f}s "
                         f"({(frames_processed + frames_skipped)/elapsed:.2f} FPS)"
                     )
                 

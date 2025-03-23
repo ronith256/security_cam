@@ -1,6 +1,7 @@
 # app/core/camera_manager.py
 
 import asyncio
+from datetime import datetime
 import cv2
 import logging
 import time
@@ -147,6 +148,71 @@ class CameraManager:
         for key in expired_keys:
             del self.frame_cache[key]
     
+    async def _connect_camera(self, camera_id: int, start_processing: bool = False) -> bool:
+        """Internal method to connect to a camera"""
+        if camera_id not in self.cameras:
+            logger.error(f"Camera {camera_id} not found in manager")
+            return False
+            
+        processor = self.cameras[camera_id]
+        
+        # Connect to the camera
+        success = await processor.connect()
+        
+        if success:
+            # Start stream processing if requested
+            if start_processing and processor.should_process:
+                # Start as a background task
+                asyncio.create_task(processor.process_stream())
+                logger.info(f"Started processing for camera {camera_id}")
+            return True
+        else:
+            return False
+
+    # Next, fix the ensure_camera_connected method to make sure processing starts:
+    async def ensure_camera_connected(self, camera_id: int) -> bool:
+        """Ensure a camera is connected if it's needed"""
+        if camera_id not in self.cameras:
+            # Try to load the camera from the database
+            async for session in get_db():
+                camera = await session.get(Camera, camera_id)
+                if camera and camera.enabled:
+                    return await self.add_camera(camera, start_processing=True)  # Start processing by default
+                return False
+        
+        # Mark this camera as in use
+        self.cameras_in_use.add(camera_id)
+        
+        processor = self.cameras[camera_id]
+        
+        # If already connected, we're good
+        if processor.connected and processor.processing:
+            return True
+                
+        # Create a task for connection to avoid multiple concurrent connections
+        if camera_id in self._connection_tasks and not self._connection_tasks[camera_id].done():
+            try:
+                return await self._connection_tasks[camera_id]
+            except Exception:
+                # If the task failed, we'll try again
+                pass
+        
+        # Start processing if not already processing
+        if processor.connected and not processor.processing and processor.should_process:
+            asyncio.create_task(processor.process_stream())
+            logger.info(f"Started processing for previously connected camera {camera_id}")
+            return True
+        
+        # Connect camera if not connected
+        self._connection_tasks[camera_id] = asyncio.create_task(self._connect_camera(camera_id, start_processing=True))
+        
+        try:
+            return await self._connection_tasks[camera_id]
+        except Exception as e:
+            logger.exception(f"Error ensuring camera {camera_id} is connected: {str(e)}")
+            return False
+
+    # Modify the add_camera method to properly handle start_processing:
     async def add_camera(self, camera: Camera, start_processing: bool = False) -> bool:
         """Add a new camera - connect and start processing if requested"""
         if not camera.enabled:
@@ -170,7 +236,7 @@ class CameraManager:
                 except Exception:
                     # If the task failed, we'll try again
                     pass
-            
+                
             # If camera already exists, update its settings
             if camera_id in self.cameras:
                 processor = self.cameras[camera_id]
@@ -187,13 +253,14 @@ class CameraManager:
                 
                 # Start processing if requested and not already processing
                 if start_processing and processor.should_process and not processor.processing:
+                    logger.info(f"Starting processing for existing camera {camera_id}")
                     if not processor.connected:
                         await processor.connect()
                     asyncio.create_task(processor.process_stream())
                     self.active_cameras += 1
                 
                 return True
-                
+                    
             # Create a new processor
             processor = StreamProcessor(
                 camera_id=camera_id,
@@ -231,60 +298,6 @@ class CameraManager:
             else:
                 logger.info(f"Added camera {camera_id} ({camera.name}) - will connect on demand")
                 return True
-    
-    async def _connect_camera(self, camera_id: int, start_processing: bool = False) -> bool:
-        """Internal method to connect to a camera"""
-        if camera_id not in self.cameras:
-            logger.error(f"Camera {camera_id} not found in manager")
-            return False
-            
-        processor = self.cameras[camera_id]
-        
-        # Connect to the camera
-        success = await processor.connect()
-        
-        if success:
-            # Start stream processing if requested
-            if start_processing and processor.should_process:
-                asyncio.create_task(processor.process_stream())
-            return True
-        else:
-            return False
-    
-    async def ensure_camera_connected(self, camera_id: int) -> bool:
-        """Ensure a camera is connected if it's needed"""
-        if camera_id not in self.cameras:
-            # Try to load the camera from the database
-            async for session in get_db():
-                camera = await session.get(Camera, camera_id)
-                if camera and camera.enabled:
-                    return await self.add_camera(camera)
-                return False
-        
-        # Mark this camera as in use
-        self.cameras_in_use.add(camera_id)
-        
-        processor = self.cameras[camera_id]
-        
-        # If already connected, we're good
-        if processor.connected:
-            return True
-            
-        # Create a task for connection to avoid multiple concurrent connections
-        if camera_id in self._connection_tasks and not self._connection_tasks[camera_id].done():
-            try:
-                return await self._connection_tasks[camera_id]
-            except Exception:
-                # If the task failed, we'll try again
-                pass
-        
-        self._connection_tasks[camera_id] = asyncio.create_task(self._connect_camera(camera_id))
-        
-        try:
-            return await self._connection_tasks[camera_id]
-        except Exception as e:
-            logger.exception(f"Error ensuring camera {camera_id} is connected: {str(e)}")
-            return False
     
     async def release_camera(self, camera_id: int):
         """Mark a camera as no longer in use - may stop streaming but continue processing"""
@@ -345,12 +358,90 @@ class CameraManager:
         """Get the latest processed frame from a camera"""
         # Ensure camera is connected
         if not await self.ensure_camera_connected(camera_id):
+            logger.warning(f"Failed to connect to camera {camera_id} in get_frame")
             return None
             
         if camera_id in self.cameras:
-            return self.cameras[camera_id].get_latest_frame()
+            frame_data = self.cameras[camera_id].get_latest_frame()
+            
+            if frame_data is None and camera_id in self.cameras_in_use:
+                # If camera is in use but no frame is available, log this issue
+                logger.warning(f"No frame data available for camera {camera_id} despite being in use")
+                
+                # Try to check if processor is truly processing
+                processor = self.cameras[camera_id]
+                if not processor.processing and processor.should_process:
+                    logger.info(f"Starting processing for camera {camera_id} since it was supposed to be processing")
+                    asyncio.create_task(processor.process_stream())
+            
+            return frame_data
         return None
     
+    def _create_no_signal_frame(self, camera_id: int) -> bytes:
+        """Create a 'No Signal' frame when no actual frame is available"""
+        try:
+            # Create a blank image
+            width, height = 640, 360
+            img = np.zeros((height, width, 3), np.uint8)
+            
+            # Add camera ID and timestamp
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            
+            # Add "No Signal" text
+            text = f"Camera {camera_id} - No Signal"
+            text_size = cv2.getTextSize(text, font, 1, 2)[0]
+            text_x = (width - text_size[0]) // 2
+            text_y = (height + text_size[1]) // 2
+            cv2.putText(img, text, (text_x, text_y), font, 1, (255, 255, 255), 2)
+            
+            # Add timestamp
+            cv2.putText(img, timestamp, (10, height - 10), font, 0.5, (150, 150, 150), 1)
+            
+            # Convert to JPEG
+            _, jpeg = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+            return jpeg.tobytes()
+        except Exception as e:
+            logger.exception(f"Error creating no signal frame: {str(e)}")
+            return None
+        
+    def _create_error_frame(self, camera_id: int, error_message: str) -> bytes:
+        """Create an 'Error' frame when an exception occurs"""
+        try:
+            # Create a blank image with red tint to indicate error
+            width, height = 640, 360
+            img = np.zeros((height, width, 3), np.uint8)
+            img[:, :, 2] = 40  # Add some red to the background
+            
+            # Add error header
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            header = f"Camera {camera_id} - Error"
+            header_size = cv2.getTextSize(header, font, 1, 2)[0]
+            header_x = (width - header_size[0]) // 2
+            header_y = height // 3
+            cv2.putText(img, header, (header_x, header_y), font, 1, (50, 50, 255), 2)
+            
+            # Add error message (truncate if too long)
+            max_chars = 50  # Maximum characters per line
+            if len(error_message) > max_chars:
+                error_message = error_message[:max_chars-3] + "..."
+                
+            message_size = cv2.getTextSize(error_message, font, 0.5, 1)[0]
+            message_x = (width - message_size[0]) // 2
+            message_y = height // 2
+            cv2.putText(img, error_message, (message_x, message_y), font, 0.5, (200, 200, 255), 1)
+            
+            # Add timestamp
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            cv2.putText(img, timestamp, (10, height - 10), font, 0.5, (150, 150, 150), 1)
+            
+            # Convert to JPEG
+            _, jpeg = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+            return jpeg.tobytes()
+        except Exception as e:
+            logger.exception(f"Error creating error frame: {str(e)}")
+            return None
+
     async def get_jpeg_frame(self, camera_id: int, high_quality: bool = False) -> Optional[bytes]:
         """Get the latest frame as JPEG bytes, with optional high quality"""
         # Check cache first for low quality requests
@@ -361,11 +452,16 @@ class CameraManager:
                 logger.debug(f"Returning cached JPEG frame for camera {camera_id}")
                 return cache_entry["frame"]
         
-        # Ensure camera is connected
-        if not await self.ensure_camera_connected(camera_id):
-            logger.error(f"Failed to connect to camera {camera_id}")
+        # Ensure camera is connected and processing
+        connected = await self.ensure_camera_connected(camera_id)
+        if not connected:
+            logger.error(f"Failed to connect to camera {camera_id} in get_jpeg_frame")
+            # Create a blank frame with "No signal" text as fallback
+            fallback_frame = self._create_no_signal_frame(camera_id)
+            if fallback_frame is not None:
+                return fallback_frame
             return None
-            
+        
         try:
             frame_data = await self.get_frame(camera_id)
             if frame_data:
@@ -388,10 +484,14 @@ class CameraManager:
                 return jpeg_bytes
             else:
                 logger.warning(f"No frame data available for camera {camera_id}")
-                return None
+                # Create a blank frame with "No signal" text as fallback
+                fallback_frame = self._create_no_signal_frame(camera_id)
+                return fallback_frame
         except Exception as e:
             logger.exception(f"Error getting JPEG frame for camera {camera_id}: {str(e)}")
-            return None
+            # Create a blank frame with "Error" text as fallback
+            error_frame = self._create_error_frame(camera_id, str(e))
+            return error_frame
     
     async def take_template_snapshot(self, camera_id: int) -> Optional[bytes]:
         """Take a snapshot to use as a template"""
