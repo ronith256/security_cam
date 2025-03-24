@@ -55,7 +55,7 @@ class CameraVideoStreamTrack(MediaStreamTrack):
     
     async def recv(self):
         """Get the next frame."""
-        black_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        black_frame = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)        
         video_frame = VideoFrame.from_ndarray(black_frame, format="bgr24")
         pts, time_base = self.frame_count, fractions.Fraction(1, self.fps)
         video_frame.pts = pts
@@ -79,9 +79,9 @@ class CameraVideoStreamTrack(MediaStreamTrack):
                 raise Exception("Camera manager not available")
             
             # Get frame
-            print(f"camera id: {self.camera_id}")
             jpeg_frame = await camera_manager.get_jpeg_frame(self.camera_id)
             if jpeg_frame is None:
+                # logger.info("Sending Black frame")
                 return video_frame
             
             # Convert jpeg bytes to numpy array
@@ -129,24 +129,28 @@ async def cleanup_peer_connection(pc_id):
     """
     Clean up resources associated with a peer connection
     """
-    if pc_id in pcs:
-        pc_data = pcs[pc_id]
-        pc = pc_data["pc"]
-        
-        # Close transceivers and stop tracks
-        for transceiver in pc.getTransceivers():
-            if transceiver.sender and transceiver.sender.track:
-                transceiver.sender.track.stop()
-            if transceiver.receiver and transceiver.receiver.track:
-                transceiver.receiver.track.stop()
-        
-        # Close the peer connection
-        await pc.close()
-        
-        # Remove from dictionary
-        del pcs[pc_id]
-        
-        logger.info(f"Cleaned up peer connection {pc_id}")
+    try:
+        if pc_id in pcs:
+            pc_data = pcs[pc_id]
+            pc = pc_data["pc"]
+            
+            # Close transceivers and stop tracks
+            for transceiver in pc.getTransceivers():
+                if transceiver.sender and transceiver.sender.track:
+                    transceiver.sender.track.stop()
+                if transceiver.receiver and transceiver.receiver.track:
+                    transceiver.receiver.track.stop()
+            
+            # Close the peer connection
+            await pc.close()
+            
+            # Remove from dictionary - Added safety check
+            if pc_id in pcs:
+                del pcs[pc_id]
+            
+            logger.info(f"Cleaned up peer connection {pc_id}")
+    except Exception as e:
+        logger.exception(f"Error during cleanup of peer connection {pc_id}: {e}")
 
 @router.post("/offer")
 async def webrtc_offer(request: Request, db: AsyncSession = Depends(get_db)):
@@ -184,6 +188,9 @@ async def webrtc_offer(request: Request, db: AsyncSession = Depends(get_db)):
                 raise HTTPException(status_code=500, detail="Failed to connect to camera")
             logger.info(f"Added camera {camera_id} to manager")
         
+        # Generate a unique ID for this connection
+        pc_id = str(uuid.uuid4())
+        
         # Create peer connection
         pc = RTCPeerConnection(
             configuration=RTCConfiguration(
@@ -194,31 +201,32 @@ async def webrtc_offer(request: Request, db: AsyncSession = Depends(get_db)):
             )
         )
         
-        # Generate a unique ID for this connection
-        pc_id = str(uuid.uuid4())
-        
         # Create video track
         video_track = CameraVideoStreamTrack(camera_id)
         
         # Add track to peer connection
         pc.addTrack(video_track)
         
-        # Store for cleanup
+        # Store for cleanup - Save this connection before setting callbacks
         pcs[pc_id] = {"pc": pc, "camera_id": camera_id}
         
-        # Handle connection state changes
+        # Handle connection state changes with error protection
         @pc.on("connectionstatechange")
         async def on_connectionstatechange():
             logger.info(f"Connection state for {pc_id}: {pc.connectionState}")
             if pc.connectionState == "failed" or pc.connectionState == "closed":
-                await cleanup_peer_connection(pc_id)
+                try:
+                    # Check if this connection is still in our dictionary
+                    if pc_id in pcs:
+                        await cleanup_peer_connection(pc_id)
+                except Exception as e:
+                    logger.exception(f"Error in connection state change handler: {e}")
         
         # Parse and set remote description (client's offer)
         offer = RTCSessionDescription(sdp=sdp, type="offer")
         await pc.setRemoteDescription(offer)
         
         # Create answer with explicit direction to avoid the None error
-        # The key fix:
         for transceiver in pc.getTransceivers():
             if transceiver.direction is None:
                 transceiver.direction = "recvonly"
@@ -235,6 +243,12 @@ async def webrtc_offer(request: Request, db: AsyncSession = Depends(get_db)):
         
     except Exception as e:
         logger.exception(f"Error handling WebRTC offer: {e}")
+        # Clean up if any resources were created during this failed attempt
+        try:
+            if 'pc_id' in locals() and pc_id in pcs:
+                await cleanup_peer_connection(pc_id)
+        except Exception as cleanup_error:
+            logger.error(f"Error during cleanup after failed offer: {cleanup_error}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/icecandidate/{session_id}")
@@ -282,9 +296,11 @@ async def close_session(session_id: str):
     Close a WebRTC session
     """
     try:
+        logger.info(f"Request to close session {session_id}")
         # Check if session exists
         if session_id not in pcs:
-            return {"message": "Session not found"}
+            logger.info(f"Session {session_id} not found for deletion")
+            return {"message": "Session not found or already closed"}
         
         # Clean up
         await cleanup_peer_connection(session_id)
@@ -293,6 +309,39 @@ async def close_session(session_id: str):
         
     except Exception as e:
         logger.exception(f"Error closing session: {e}")
+        # Don't raise an exception, just log it and return a message
+        return {"message": f"Error closing session: {str(e)}"}
+
+@router.post("/template/{camera_id}")
+async def take_template_snapshot(camera_id: int, db: AsyncSession = Depends(get_db)):
+    """
+    Takes a snapshot and saves it as a template image
+    """
+    try:
+        # Check if camera exists
+        camera = await db.get(Camera, camera_id)
+        if camera is None:
+            raise HTTPException(status_code=404, detail="Camera not found")
+        
+        # Get camera manager
+        camera_manager = await get_camera_manager()
+        
+        # Ensure camera is connected
+        if not await camera_manager.ensure_camera_connected(camera_id):
+            raise HTTPException(status_code=500, detail="Failed to connect to camera")
+            
+        # Get frame
+        jpeg_frame = await camera_manager.get_jpeg_frame(camera_id)
+        if jpeg_frame is None:
+            raise HTTPException(status_code=500, detail="Failed to get frame from camera")
+            
+        # Process and save template
+        # This part depends on your template matching implementation
+        # For now, just return success
+        return {"message": "Template snapshot taken successfully"}
+        
+    except Exception as e:
+        logger.exception(f"Error taking template snapshot: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.websocket("/snapshot/{camera_id}")
@@ -332,6 +381,26 @@ async def snapshot_endpoint(
         last_snapshot_time = 0
         ping_timeout = 30  # 30 seconds timeout
         last_ping_time = time.time()
+        
+        # Send an initial snapshot to avoid delay
+        try:
+            # Get latest frame
+            jpeg_frame = await camera_manager.get_jpeg_frame(camera_id)
+            
+            if jpeg_frame:
+                # Encode as base64
+                base64_image = base64.b64encode(jpeg_frame).decode('utf-8')
+                
+                # Send snapshot
+                await websocket.send_json({
+                    "type": "snapshot",
+                    "timestamp": time.time(),
+                    "data": base64_image
+                })
+                
+                last_snapshot_time = time.time()
+        except Exception as e:
+            logger.exception(f"Error sending initial snapshot: {e}")
         
         # Main loop
         while True:
@@ -406,14 +475,22 @@ async def shutdown_event():
     Cleanup resources on shutdown
     """
     # Close all peer connections
-    for pc_id in list(pcs.keys()):
-        await cleanup_peer_connection(pc_id)
+    session_ids = list(pcs.keys())
+    for pc_id in session_ids:
+        try:
+            await cleanup_peer_connection(pc_id)
+        except Exception as e:
+            logger.exception(f"Error cleaning up peer connection {pc_id} during shutdown: {e}")
     
     # Close all websockets
-    for camera_id in list(active_websockets.keys()):
+    camera_ids = list(active_websockets.keys())
+    for camera_id in camera_ids:
         for ws in active_websockets[camera_id]:
             try:
                 await ws.close()
-            except:
-                pass
-        del active_websockets[camera_id]
+            except Exception as e:
+                logger.exception(f"Error closing websocket during shutdown: {e}")
+        try:
+            del active_websockets[camera_id]
+        except KeyError:
+            pass

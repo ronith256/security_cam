@@ -1,4 +1,4 @@
-// src/components/cameras/CameraStream.tsx
+// frontend/src/components/cameras/CameraStream.tsx
 import React, { memo } from 'react';
 import WebRTCStream from './WebRTCStream';
 
