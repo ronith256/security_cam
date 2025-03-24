@@ -76,4 +76,9 @@ DEFAULT_SETTINGS = [
         "value": True,
         "description": "Enable/disable global notifications"
     },
+    {
+        "key": "idle_snapshot_interval", 
+        "value": 5,
+        "description": "Time between snapshot updates when camera is not actively streaming"
+    }
 ]
