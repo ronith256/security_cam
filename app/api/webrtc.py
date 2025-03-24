@@ -55,14 +55,14 @@ class CameraVideoStreamTrack(MediaStreamTrack):
     
     async def recv(self):
         """Get the next frame."""
+        black_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        video_frame = VideoFrame.from_ndarray(black_frame, format="bgr24")
+        pts, time_base = self.frame_count, fractions.Fraction(1, self.fps)
+        video_frame.pts = pts
+        video_frame.time_base = time_base
+        self.frame_count += 1
         if self.stopped:
             # If stopped, return a black frame
-            black_frame = np.zeros((480, 640, 3), dtype=np.uint8)
-            video_frame = VideoFrame.from_ndarray(black_frame, format="bgr24")
-            pts, time_base = self.frame_count, fractions.Fraction(1, self.fps)
-            video_frame.pts = pts
-            video_frame.time_base = time_base
-            self.frame_count += 1
             return video_frame
         
         # Throttle frame rate
@@ -79,9 +79,10 @@ class CameraVideoStreamTrack(MediaStreamTrack):
                 raise Exception("Camera manager not available")
             
             # Get frame
+            print(f"camera id: {self.camera_id}")
             jpeg_frame = await camera_manager.get_jpeg_frame(self.camera_id)
             if jpeg_frame is None:
-                raise Exception("No frame available")
+                return video_frame
             
             # Convert jpeg bytes to numpy array
             frame = cv2.imdecode(np.frombuffer(jpeg_frame, np.uint8), cv2.IMREAD_COLOR)
