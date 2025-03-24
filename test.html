@@ -1,422 +1,540 @@
 <!DOCTYPE html>
 <html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>CCTV Camera Viewer</title>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/moment.js/2.29.4/moment.min.js"></script>
     <style>
-        body {
-            font-family: Arial, sans-serif;
-            margin: 0;
-            padding: 20px;
-            background: #1a1a1a;
-            color: #fff;
-        }
+      body {
+        font-family: Arial, sans-serif;
+        margin: 0;
+        padding: 20px;
+        background: #1a1a1a;
+        color: #fff;
+      }
 
-        .container {
-            display: grid;
-            grid-template-columns: 2fr 1fr;
-            gap: 20px;
-            max-width: 1400px;
-            margin: 0 auto;
-        }
+      .container {
+        display: grid;
+        grid-template-columns: 2fr 1fr;
+        gap: 20px;
+        max-width: 1400px;
+        margin: 0 auto;
+      }
 
-        .video-container {
-            background: #000;
-            border-radius: 8px;
-            overflow: hidden;
-            position: relative;
-        }
+      .video-container {
+        background: #000;
+        border-radius: 8px;
+        overflow: hidden;
+        position: relative;
+      }
 
-        video {
-            width: 100%;
-            height: auto;
-            display: block;
-        }
+      video {
+        width: 100%;
+        height: auto;
+        display: block;
+      }
 
-        .canvas-overlay {
-            position: absolute;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            display: none;
-        }
+      .canvas-overlay {
+        position: absolute;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        display: none;
+      }
 
-        .controls {
-            background: #2a2a2a;
-            padding: 15px;
-            border-radius: 8px;
-            margin-bottom: 20px;
-        }
+      .controls {
+        background: #2a2a2a;
+        padding: 15px;
+        border-radius: 8px;
+        margin-bottom: 20px;
+      }
 
-        .controls button {
-            background: #4CAF50;
-            color: white;
-            border: none;
-            padding: 10px 20px;
-            border-radius: 4px;
-            cursor: pointer;
-            margin-right: 10px;
-        }
+      .controls button {
+        background: #4caf50;
+        color: white;
+        border: none;
+        padding: 10px 20px;
+        border-radius: 4px;
+        cursor: pointer;
+        margin-right: 10px;
+      }
 
-        .controls button:hover {
-            background: #45a049;
-        }
+      .controls button:hover {
+        background: #45a049;
+      }
 
-        .controls button.disconnect {
-            background: #f44336;
-        }
+      .controls button.disconnect {
+        background: #f44336;
+      }
 
-        .controls button.disconnect:hover {
-            background: #da190b;
-        }
+      .controls button.disconnect:hover {
+        background: #da190b;
+      }
 
-        .mode-select {
-            padding: 8px;
-            margin-right: 10px;
-            border-radius: 4px;
-            background: #333;
-            color: white;
-            border: 1px solid #444;
-        }
+      .mode-select {
+        padding: 8px;
+        margin-right: 10px;
+        border-radius: 4px;
+        background: #333;
+        color: white;
+        border: 1px solid #444;
+      }
 
-        .stats {
-            background: #2a2a2a;
-            padding: 15px;
-            border-radius: 8px;
-            margin-bottom: 20px;
-        }
+      .stats {
+        background: #2a2a2a;
+        padding: 15px;
+        border-radius: 8px;
+        margin-bottom: 20px;
+      }
 
-        .stats table {
-            width: 100%;
-            border-collapse: collapse;
-        }
+      .stats table {
+        width: 100%;
+        border-collapse: collapse;
+      }
 
-        .stats td, .stats th {
-            padding: 8px;
-            text-align: left;
-            border-bottom: 1px solid #444;
-        }
+      .stats td,
+      .stats th {
+        padding: 8px;
+        text-align: left;
+        border-bottom: 1px solid #444;
+      }
 
-        .logs {
-            background: #2a2a2a;
-            padding: 15px;
-            border-radius: 8px;
-            height: 400px;
-            overflow-y: auto;
-        }
+      .logs {
+        background: #2a2a2a;
+        padding: 15px;
+        border-radius: 8px;
+        height: 400px;
+        overflow-y: auto;
+      }
 
-        .log-entry {
-            margin-bottom: 8px;
-            font-family: monospace;
-        }
+      .log-entry {
+        margin-bottom: 8px;
+        font-family: monospace;
+      }
 
-        .log-entry .timestamp {
-            color: #888;
-        }
+      .log-entry .timestamp {
+        color: #888;
+      }
 
-        .log-entry.error { color: #ff4444; }
-        .log-entry.warning { color: #ffbb33; }
-        .log-entry.info { color: #00C851; }
-        .log-entry.debug { color: #888; }
+      .log-entry.error {
+        color: #ff4444;
+      }
+      .log-entry.warning {
+        color: #ffbb33;
+      }
+      .log-entry.info {
+        color: #00c851;
+      }
+      .log-entry.debug {
+        color: #888;
+      }
 
-        .snapshot-image {
-            width: 100%;
-            height: auto;
-            display: none;
-        }
+      .snapshot-image {
+        width: 100%;
+        height: auto;
+        display: none;
+      }
     </style>
-</head>
-<body>
+  </head>
+  <body>
     <div class="container">
-        <div class="main-content">
-            <div class="controls">
-                <select id="mode" class="mode-select">
-                    <option value="webrtc">WebRTC Mode</option>
-                    <option value="snapshot">Snapshot Mode</option>
-                </select>
-                <button id="connect">Connect</button>
-                <button id="disconnect" class="disconnect" style="display: none;">Disconnect</button>
-            </div>
-
-            <div class="video-container">
-                <video id="videoElement" autoplay playsinline></video>
-                <canvas id="overlayCanvas" class="canvas-overlay"></canvas>
-                <img id="snapshotImage" class="snapshot-image" />
-            </div>
-
-            <div class="stats">
-                <h3>Stream Statistics</h3>
-                <table>
-                    <tr>
-                        <td>Mode:</td>
-                        <td id="statMode">-</td>
-                    </tr>
-                    <tr>
-                        <td>Status:</td>
-                        <td id="statStatus">Disconnected</td>
-                    </tr>
-                    <tr>
-                        <td>FPS:</td>
-                        <td id="statFps">0</td>
-                    </tr>
-                    <tr>
-                        <td>Connection:</td>
-                        <td id="statConnection">-</td>
-                    </tr>
-                    <tr>
-                        <td>Frame Count:</td>
-                        <td id="statFrames">0</td>
-                    </tr>
-                </table>
-            </div>
+      <div class="main-content">
+        <div class="controls">
+          <select id="mode" class="mode-select">
+            <option value="webrtc">WebRTC Mode</option>
+            <option value="snapshot">Snapshot Mode</option>
+          </select>
+          <button id="connect">Connect</button>
+          <button id="disconnect" class="disconnect" style="display: none">
+            Disconnect
+          </button>
         </div>
 
-        <div class="sidebar">
-            <div class="logs" id="logs"></div>
+        <div class="video-container">
+          <video id="videoElement" autoplay playsinline></video>
+          <canvas id="overlayCanvas" class="canvas-overlay"></canvas>
+          <img id="snapshotImage" class="snapshot-image" />
         </div>
+
+        <div class="stats">
+          <h3>Stream Statistics</h3>
+          <table>
+            <tr>
+              <td>Mode:</td>
+              <td id="statMode">-</td>
+            </tr>
+            <tr>
+              <td>Status:</td>
+              <td id="statStatus">Disconnected</td>
+            </tr>
+            <tr>
+              <td>FPS:</td>
+              <td id="statFps">0</td>
+            </tr>
+            <tr>
+              <td>Connection:</td>
+              <td id="statConnection">-</td>
+            </tr>
+            <tr>
+              <td>Frame Count:</td>
+              <td id="statFrames">0</td>
+            </tr>
+          </table>
+        </div>
+      </div>
+
+      <div class="sidebar">
+        <div class="logs" id="logs"></div>
+      </div>
     </div>
 
     <script>
-        // Configuration
-        const API_BASE_URL = 'http://localhost:8000/api';
-        const CAMERA_ID = 1;
-        const WS_BASE_URL = API_BASE_URL.replace('http', 'ws');
+      // Configuration
+      const API_BASE_URL = "http://localhost:8000/api";
+      const CAMERA_ID = 1;
+      const WS_BASE_URL = API_BASE_URL.replace("http", "ws");
 
-        // Global variables
-        let peerConnection = null;
-        let webSocket = null;
-        let frameCount = 0;
-        let startTime = 0;
-        let isConnected = false;
-        let statsInterval = null;
+      // Global variables
+      let peerConnection = null;
+      let webSocket = null;
+      let frameCount = 0;
+      let startTime = 0;
+      let isConnected = false;
+      let statsInterval = null;
+      let sessionId = null; // Store WebRTC session ID
 
-        // Elements
-        const videoElement = document.getElementById('videoElement');
-        const snapshotImage = document.getElementById('snapshotImage');
-        const connectButton = document.getElementById('connect');
-        const disconnectButton = document.getElementById('disconnect');
-        const modeSelect = document.getElementById('mode');
-        const logsDiv = document.getElementById('logs');
+      // Elements
+      const videoElement = document.getElementById("videoElement");
+      const snapshotImage = document.getElementById("snapshotImage");
+      const connectButton = document.getElementById("connect");
+      const disconnectButton = document.getElementById("disconnect");
+      const modeSelect = document.getElementById("mode");
+      const logsDiv = document.getElementById("logs");
 
-        // Connect button handler
-        connectButton.addEventListener('click', async () => {
-            const mode = modeSelect.value;
-            if (mode === 'webrtc') {
-                await connectWebRTC();
+      // Connect button handler
+      connectButton.addEventListener("click", async () => {
+        const mode = modeSelect.value;
+        if (mode === "webrtc") {
+          await connectWebRTC();
+        } else {
+          await connectSnapshot();
+        }
+      });
+
+      // Disconnect button handler
+      disconnectButton.addEventListener("click", async () => {
+        await disconnect();
+      });
+
+      // WebRTC connection
+      async function connectWebRTC() {
+        try {
+          log("Connecting via WebRTC...", "info");
+          updateStatus("Connecting");
+
+          // Create peer connection
+          const config = {
+            iceServers: [
+              { urls: "stun:stun.l.google.com:19302" },
+              { urls: "stun:stun1.l.google.com:19302" },
+            ],
+          };
+          peerConnection = new RTCPeerConnection(config);
+
+          // Set up video handling
+          peerConnection.ontrack = ({ track, streams }) => {
+            log("Received video track", "info");
+            if (streams && streams[0]) {
+              videoElement.srcObject = streams[0];
+              videoElement.style.display = "block";
+              snapshotImage.style.display = "none";
+
+              // Important: manually start playing the video
+              videoElement.play().catch((e) => {
+                log(`Error playing video: ${e.message}`, "error");
+              });
+            }
+          };
+
+          // Connection state handling
+          peerConnection.onconnectionstatechange = () => {
+            log(`Connection state: ${peerConnection.connectionState}`, "info");
+            updateStatus(peerConnection.connectionState);
+            document.getElementById("statConnection").textContent =
+              peerConnection.connectionState;
+          };
+
+          // Create and send offer
+          const offer = await peerConnection.createOffer({
+            offerToReceiveVideo: true,
+            offerToReceiveAudio: false,
+          });
+          await peerConnection.setLocalDescription(offer);
+
+          // Debug SDP
+          log(
+            `Sending offer with SDP length: ${peerConnection.localDescription.sdp.length} bytes`,
+            "debug"
+          );
+
+          // Add timeout for fetch
+          const controller = new AbortController();
+          const timeoutId = setTimeout(() => controller.abort(), 10000);
+
+          // Send offer to server with better error handling
+          try {
+            const response = await fetch(`${API_BASE_URL}/webrtc/offer`, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+              },
+              body: JSON.stringify({
+                cameraId: CAMERA_ID,
+                sdp: peerConnection.localDescription.sdp,
+              }),
+              signal: controller.signal,
+            });
+
+            clearTimeout(timeoutId);
+
+            if (!response.ok) {
+              const errorText = await response.text();
+              throw new Error(
+                `Server error (${response.status}): ${errorText}`
+              );
+            }
+
+            const answer = await response.json();
+
+            // Save session ID
+            sessionId = answer.session_id;
+            log(`Received session ID: ${sessionId}`, "info");
+
+            // Set remote description (server's answer)
+            await peerConnection.setRemoteDescription(
+              new RTCSessionDescription({
+                type: answer.type,
+                sdp: answer.sdp,
+              })
+            );
+
+            // Handle ICE candidate events
+            peerConnection.onicecandidate = (event) => {
+              if (event.candidate) {
+                // Send ICE candidate to server
+                sendIceCandidate(event.candidate);
+              }
+            };
+
+            // Update UI
+            isConnected = true;
+            connectButton.style.display = "none";
+            disconnectButton.style.display = "inline-block";
+            startTime = Date.now();
+            startStatsUpdates("WebRTC");
+
+            log("WebRTC connection established", "info");
+          } catch (fetchError) {
+            clearTimeout(timeoutId);
+            if (fetchError.name === "AbortError") {
+              throw new Error("Connection timed out - server not responding");
             } else {
-                await connectSnapshot();
+              throw fetchError;
             }
-        });
+          }
+        } catch (error) {
+          log(`Connection error: ${error.message}`, "error");
+          await disconnect();
+        }
+      }
 
-        // Disconnect button handler
-        disconnectButton.addEventListener('click', async () => {
-            await disconnect();
-        });
-
-        // WebRTC connection
-        async function connectWebRTC() {
-            try {
-                log('Connecting via WebRTC...', 'info');
-                updateStatus('Connecting');
-
-                // Create peer connection
-                const config = {
-                    iceServers: [
-                        { urls: 'stun:stun.l.google.com:19302' }
-                    ]
-                };
-                peerConnection = new RTCPeerConnection(config);
-
-                // Set up video handling
-                peerConnection.ontrack = ({track}) => {
-                    log('Received video track', 'info');
-                    videoElement.srcObject = new MediaStream([track]);
-                    videoElement.style.display = 'block';
-                    snapshotImage.style.display = 'none';
-                };
-
-                // Connection state handling
-                peerConnection.onconnectionstatechange = () => {
-                    log(`Connection state: ${peerConnection.connectionState}`, 'info');
-                    updateStatus(peerConnection.connectionState);
-                    document.getElementById('statConnection').textContent = peerConnection.connectionState;
-                };
-
-                // Create and send offer
-                const offer = await peerConnection.createOffer();
-                await peerConnection.setLocalDescription(offer);
-
-                const response = await fetch(`${API_BASE_URL}/webrtc/offer`, {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json'
-                    },
-                    body: JSON.stringify({
-                        cameraId: CAMERA_ID,
-                        sdp: peerConnection.localDescription.sdp
-                    })
-                });
-
-                if (!response.ok) {
-                    throw new Error(`Server returned ${response.status}`);
-                }
-
-                const answer = await response.json();
-                await peerConnection.setRemoteDescription(
-                    new RTCSessionDescription({
-                        type: answer.type,
-                        sdp: answer.sdp
-                    })
-                );
-
-                // Update UI
-                isConnected = true;
-                connectButton.style.display = 'none';
-                disconnectButton.style.display = 'inline-block';
-                startTime = Date.now();
-                startStatsUpdates('WebRTC');
-
-                log('WebRTC connection established', 'info');
-
-            } catch (error) {
-                log(`Connection error: ${error.message}`, 'error');
-                await disconnect();
-            }
+      // Send ICE candidate to server
+      async function sendIceCandidate(candidate) {
+        if (!sessionId) {
+          log("No session ID, cannot send ICE candidate", "warning");
+          return;
         }
 
-        // Snapshot connection
-        async function connectSnapshot() {
-            try {
-                log('Connecting via Snapshot mode...', 'info');
-                updateStatus('Connecting');
-
-                // Setup WebSocket
-                webSocket = new WebSocket(`${WS_BASE_URL}/webrtc/snapshot/${CAMERA_ID}`);
-
-                webSocket.onopen = () => {
-                    log('WebSocket connected', 'info');
-                    isConnected = true;
-                    connectButton.style.display = 'none';
-                    disconnectButton.style.display = 'inline-block';
-                    startTime = Date.now();
-                    startStatsUpdates('Snapshot');
-                    updateStatus('Connected');
-                    
-                    // Start ping interval
-                    setInterval(() => {
-                        if (webSocket.readyState === WebSocket.OPEN) {
-                            webSocket.send(JSON.stringify({ type: 'ping' }));
-                        }
-                    }, 5000);
-
-                    // Initial ping
-                    webSocket.send(JSON.stringify({ type: 'ping' }));
-                };
-
-                webSocket.onmessage = (event) => {
-                    const data = JSON.parse(event.data);
-                    
-                    if (data.type === 'snapshot') {
-                        frameCount++;
-                        videoElement.style.display = 'none';
-                        snapshotImage.style.display = 'block';
-                        snapshotImage.src = `data:image/jpeg;base64,${data.data}`;
-                    }
-                };
-
-                webSocket.onclose = () => {
-                    log('WebSocket disconnected', 'warning');
-                    disconnect();
-                };
-
-                webSocket.onerror = (error) => {
-                    log(`WebSocket error: ${error.message}`, 'error');
-                    disconnect();
-                };
-
-            } catch (error) {
-                log(`Connection error: ${error.message}`, 'error');
-                await disconnect();
+        try {
+          const response = await fetch(
+            `${API_BASE_URL}/webrtc/icecandidate/${sessionId}`,
+            {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+              },
+              body: JSON.stringify({
+                candidate: candidate.candidate,
+                sdpMid: candidate.sdpMid,
+                sdpMLineIndex: candidate.sdpMLineIndex,
+              }),
             }
+          );
+
+          if (!response.ok) {
+            log(`Failed to send ICE candidate: ${response.status}`, "warning");
+          }
+        } catch (error) {
+          log(`Error sending ICE candidate: ${error.message}`, "warning");
+        }
+      }
+
+      // Snapshot connection
+      async function connectSnapshot() {
+        try {
+          log("Connecting via Snapshot mode...", "info");
+          updateStatus("Connecting");
+
+          // Setup WebSocket
+          webSocket = new WebSocket(
+            `${WS_BASE_URL}/webrtc/snapshot/${CAMERA_ID}`
+          );
+
+          webSocket.onopen = () => {
+            log("WebSocket connected", "info");
+            isConnected = true;
+            connectButton.style.display = "none";
+            disconnectButton.style.display = "inline-block";
+            startTime = Date.now();
+            startStatsUpdates("Snapshot");
+            updateStatus("Connected");
+
+            // Start ping interval
+            setInterval(() => {
+              if (webSocket.readyState === WebSocket.OPEN) {
+                webSocket.send(JSON.stringify({ type: "ping" }));
+              }
+            }, 5000);
+
+            // Initial ping
+            webSocket.send(JSON.stringify({ type: "ping" }));
+          };
+
+          webSocket.onmessage = (event) => {
+            const data = JSON.parse(event.data);
+
+            if (data.type === "snapshot") {
+              frameCount++;
+              videoElement.style.display = "none";
+              snapshotImage.style.display = "block";
+              snapshotImage.src = `data:image/jpeg;base64,${data.data}`;
+            }
+          };
+
+          webSocket.onclose = () => {
+            log("WebSocket disconnected", "warning");
+            disconnect();
+          };
+
+          webSocket.onerror = (error) => {
+            log(
+              `WebSocket error: ${error.message || "Unknown error"}`,
+              "error"
+            );
+            disconnect();
+          };
+        } catch (error) {
+          log(`Connection error: ${error.message}`, "error");
+          await disconnect();
+        }
+      }
+
+      // Disconnect handling
+      async function disconnect() {
+        isConnected = false;
+        updateStatus("Disconnected");
+
+        if (sessionId) {
+          // Close WebRTC session on server
+          try {
+            await fetch(`${API_BASE_URL}/webrtc/session/${sessionId}`, {
+              method: "DELETE",
+            });
+            log(`Closed session ${sessionId} on server`, "info");
+          } catch (error) {
+            log(`Error closing session on server: ${error.message}`, "warning");
+          }
+          sessionId = null;
         }
 
-        // Disconnect handling
-        async function disconnect() {
-            isConnected = false;
-            updateStatus('Disconnected');
-
-            if (peerConnection) {
-                peerConnection.close();
-                peerConnection = null;
-            }
-
-            if (webSocket) {
-                webSocket.close();
-                webSocket = null;
-            }
-
-            videoElement.srcObject = null;
-            videoElement.style.display = 'none';
-            snapshotImage.style.display = 'none';
-            snapshotImage.src = '';
-
-            connectButton.style.display = 'inline-block';
-            disconnectButton.style.display = 'none';
-
-            if (statsInterval) {
-                clearInterval(statsInterval);
-                statsInterval = null;
-            }
-
-            frameCount = 0;
-            log('Disconnected', 'info');
+        if (peerConnection) {
+          peerConnection.close();
+          peerConnection = null;
         }
 
-        // Stats updates
-        function startStatsUpdates(mode) {
-            document.getElementById('statMode').textContent = mode;
-            
-            if (statsInterval) {
-                clearInterval(statsInterval);
-            }
-
-            statsInterval = setInterval(() => {
-                if (!isConnected) return;
-
-                const elapsed = (Date.now() - startTime) / 1000;
-                const fps = frameCount / elapsed;
-
-                document.getElementById('statFps').textContent = fps.toFixed(1);
-                document.getElementById('statFrames').textContent = frameCount;
-            }, 1000);
+        if (webSocket) {
+          webSocket.close();
+          webSocket = null;
         }
 
-        // Utility functions
-        function updateStatus(status) {
-            document.getElementById('statStatus').textContent = status;
+        videoElement.srcObject = null;
+        videoElement.style.display = "none";
+        snapshotImage.style.display = "none";
+        snapshotImage.src = "";
+
+        connectButton.style.display = "inline-block";
+        disconnectButton.style.display = "none";
+
+        if (statsInterval) {
+          clearInterval(statsInterval);
+          statsInterval = null;
         }
 
-        function log(message, level = 'info') {
-            const timestamp = moment().format('YYYY-MM-DD HH:mm:ss');
-            const logEntry = document.createElement('div');
-            logEntry.className = `log-entry ${level}`;
-            logEntry.innerHTML = `
-                <span class="timestamp">[${timestamp}]</span> 
-                <span class="message">${message}</span>
-            `;
-            logsDiv.insertBefore(logEntry, logsDiv.firstChild);
-            
-            // Keep only last 100 log entries
-            while (logsDiv.children.length > 100) {
-                logsDiv.removeChild(logsDiv.lastChild);
-            }
+        frameCount = 0;
+        log("Disconnected", "info");
+      }
+
+      // Stats updates
+      function startStatsUpdates(mode) {
+        document.getElementById("statMode").textContent = mode;
+
+        if (statsInterval) {
+          clearInterval(statsInterval);
         }
 
-        // Initial log
-        log('Camera viewer ready', 'info');
+        statsInterval = setInterval(() => {
+          if (!isConnected) return;
+
+          const elapsed = (Date.now() - startTime) / 1000;
+          const fps = elapsed > 0 ? frameCount / elapsed : 0;
+
+          document.getElementById("statFps").textContent = fps.toFixed(1);
+          document.getElementById("statFrames").textContent = frameCount;
+        }, 1000);
+      }
+
+      // Utility functions
+      function updateStatus(status) {
+        document.getElementById("statStatus").textContent = status;
+      }
+
+      function log(message, level = "info") {
+        const timestamp = moment().format("YYYY-MM-DD HH:mm:ss");
+        const logEntry = document.createElement("div");
+        logEntry.className = `log-entry ${level}`;
+        logEntry.innerHTML = `
+        <span class="timestamp">[${timestamp}]</span> 
+        <span class="message">${message}</span>
+    `;
+        logsDiv.insertBefore(logEntry, logsDiv.firstChild);
+
+        // Keep only last 100 log entries
+        while (logsDiv.children.length > 100) {
+          logsDiv.removeChild(logsDiv.lastChild);
+        }
+
+        // Also log to console with more details
+        if (level === "error") {
+          console.error(`[${level.toUpperCase()}] ${message}`);
+        } else {
+          console.log(`[${level.toUpperCase()}] ${message}`);
+        }
+      }
+
+      // Initial log
+      log("Camera viewer ready", "info");
     </script>
-</body>
+  </body>
 </html>

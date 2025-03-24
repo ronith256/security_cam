@@ -1,45 +1,50 @@
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, HTTPException, Depends, Request
-from sqlalchemy import select
+from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from typing import Dict, Optional, List, Any
-import json
-import cv2
-import numpy as np
-import asyncio
-import base64
 import logging
+import base64
+import asyncio
 import time
 import uuid
-from aiortc import MediaStreamTrack, RTCPeerConnection, RTCSessionDescription, RTCConfiguration, RTCIceServer
-from aiortc.contrib.media import MediaBlackhole, MediaRelay
+import json
+
+from aiortc import RTCPeerConnection, RTCSessionDescription, RTCConfiguration, RTCIceServer, MediaStreamTrack
+from aiortc.contrib.media import MediaRelay
 from av import VideoFrame
+import fractions
+import cv2
+import numpy as np
 
 from app.database import get_db
 from app.models.camera import Camera
 from app.core.camera_manager import get_camera_manager
-from app.models.settings import Settings
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
-# Global state
-pcs: Dict[str, RTCPeerConnection] = {}
-relays: Dict[str, MediaRelay] = {}
-active_websockets: Dict[int, List[WebSocket]] = {}
+# Global variables to store peer connections and video tracks
+pcs = {}
+relay = MediaRelay()
+
+# Active websockets for snapshot mode
+active_websockets = {}
 
 class CameraVideoStreamTrack(MediaStreamTrack):
-    """Video stream track that reads from camera processor"""
-    kind = "video"
+    """A video stream track that captures from the camera."""
     
-    def __init__(self, camera_id: int):
+    kind = "video"
+
+    def __init__(self, camera_id):
         super().__init__()
         self.camera_id = camera_id
         self.camera_manager = None
         self.frame_count = 0
+        self.fps = 30
+        self.frame_time = 1 / self.fps
         self.start_time = time.time()
-        self.last_frame_time = 0
-        self.frame_interval = 1.0 / 30  # Default to 30fps
-        self.pts = 0
+        self.current_time = 0
+        self.last_frame = None
         self.stopped = False
     
     async def get_camera_manager(self):
@@ -49,189 +54,244 @@ class CameraVideoStreamTrack(MediaStreamTrack):
         return self.camera_manager
     
     async def recv(self):
-        """Get the next frame"""
+        """Get the next frame."""
         if self.stopped:
-            return None
+            # If stopped, return a black frame
+            black_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+            video_frame = VideoFrame.from_ndarray(black_frame, format="bgr24")
+            pts, time_base = self.frame_count, fractions.Fraction(1, self.fps)
+            video_frame.pts = pts
+            video_frame.time_base = time_base
+            self.frame_count += 1
+            return video_frame
+        
+        # Throttle frame rate
+        self.current_time = time.time() - self.start_time
+        next_frame_time = self.frame_count * self.frame_time
+        wait_time = max(0, next_frame_time - self.current_time)
+        if wait_time > 0:
+            await asyncio.sleep(wait_time)
         
         try:
-            # Get camera manager
+            # Get frame from camera
             camera_manager = await self.get_camera_manager()
             if not camera_manager:
                 raise Exception("Camera manager not available")
             
-            # Get processor for this camera
-            processor = camera_manager.cameras.get(self.camera_id)
-            if not processor:
-                raise Exception("Camera not found")
+            # Get frame
+            jpeg_frame = await camera_manager.get_jpeg_frame(self.camera_id)
+            if jpeg_frame is None:
+                raise Exception("No frame available")
             
-            # Throttle frame rate
-            current_time = time.time()
-            elapsed = current_time - self.last_frame_time
-            if elapsed < self.frame_interval:
-                await asyncio.sleep(max(0, self.frame_interval - elapsed))
+            # Convert jpeg bytes to numpy array
+            frame = cv2.imdecode(np.frombuffer(jpeg_frame, np.uint8), cv2.IMREAD_COLOR)
             
-            # Get latest frame
-            frame_data = processor.get_latest_frame()
-            if frame_data is None:
-                # If no frame available, create blank frame
-                frame = np.zeros((480, 640, 3), dtype=np.uint8)
-                frame_time = current_time
-            else:
-                frame, frame_time = frame_data
+            # Convert to VideoFrame for WebRTC
+            # Note: We need to convert BGR to RGB here
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            video_frame = VideoFrame.from_ndarray(frame_rgb, format="rgb24")
             
-            # Convert to video frame
-            video_frame = VideoFrame.from_ndarray(frame, format="bgr24")
-            video_frame.pts = self.pts
-            video_frame.time_base = 1/30  # 30fps
+            # Set timing information
+            pts, time_base = self.frame_count, fractions.Fraction(1, self.fps)
+            video_frame.pts = pts
+            video_frame.time_base = time_base
             
-            # Update timing
-            self.pts += 1
+            # Update counters
             self.frame_count += 1
-            self.last_frame_time = current_time
-            
-            # Calculate FPS every 30 frames
-            if self.frame_count % 30 == 0:
-                elapsed = current_time - self.start_time
-                fps = self.frame_count / elapsed if elapsed > 0 else 0
-                logger.debug(f"Streaming camera {self.camera_id} at {fps:.2f} FPS")
+            self.last_frame = video_frame
             
             return video_frame
             
         except Exception as e:
-            logger.exception(f"Error getting frame for camera {self.camera_id}: {str(e)}")
-            self.stopped = True
-            return None
+            logger.exception(f"Error getting frame from camera {self.camera_id}: {str(e)}")
+            
+            # Return last frame if available or a black frame
+            if self.last_frame is not None:
+                return self.last_frame
+            
+            # Create a black frame as fallback
+            black_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+            video_frame = VideoFrame.from_ndarray(black_frame, format="bgr24")
+            pts, time_base = self.frame_count, fractions.Fraction(1, self.fps)
+            video_frame.pts = pts
+            video_frame.time_base = time_base
+            self.frame_count += 1
+            return video_frame
     
     def stop(self):
-        """Stop the track"""
-        self.stopped = True
-        super().stop()
+        """Stop the track."""
+        if not self.stopped:
+            self.stopped = True
+            super().stop()
 
-async def create_peer_connection(camera_id: int) -> RTCPeerConnection:
-    """Create and configure a peer connection"""
-    # Create peer connection with STUN server configuration
-    config = RTCConfiguration([
-        RTCIceServer(urls=["stun:stun.l.google.com:19302"])
-    ])
-    pc = RTCPeerConnection(configuration=config)
-    
-    # Create video track
-    video = CameraVideoStreamTrack(camera_id)
-    
-    # Add track to peer connection
-    pc.addTrack(video)
-    
-    # Store for cleanup
-    pc_id = str(uuid.uuid4())
-    pcs[pc_id] = pc
-    
-    # Handle connection state changes
-    @pc.on("connectionstatechange")
-    async def on_connectionstatechange():
-        logger.info(f"Connection state for {pc_id}: {pc.connectionState}")
-        if pc.connectionState == "failed" or pc.connectionState == "closed":
-            await cleanup_peer_connection(pc_id)
-    
-    return pc, pc_id
-
-async def cleanup_peer_connection(pc_id: str):
-    """Cleanup peer connection resources"""
-    try:
-        if pc_id in pcs:
-            pc = pcs[pc_id]
-            
-            # Close all transceivers
-            for transceiver in pc.getTransceivers():
-                if transceiver.sender:
-                    await transceiver.sender.stop()
-                if transceiver.receiver:
-                    await transceiver.receiver.stop()
-            
-            # Close peer connection
-            await pc.close()
-            
-            # Remove from tracking
-            del pcs[pc_id]
-            
-            logger.info(f"Cleaned up peer connection {pc_id}")
-    except Exception as e:
-        logger.exception(f"Error cleaning up peer connection {pc_id}: {str(e)}")
+async def cleanup_peer_connection(pc_id):
+    """
+    Clean up resources associated with a peer connection
+    """
+    if pc_id in pcs:
+        pc_data = pcs[pc_id]
+        pc = pc_data["pc"]
+        
+        # Close transceivers and stop tracks
+        for transceiver in pc.getTransceivers():
+            if transceiver.sender and transceiver.sender.track:
+                transceiver.sender.track.stop()
+            if transceiver.receiver and transceiver.receiver.track:
+                transceiver.receiver.track.stop()
+        
+        # Close the peer connection
+        await pc.close()
+        
+        # Remove from dictionary
+        del pcs[pc_id]
+        
+        logger.info(f"Cleaned up peer connection {pc_id}")
 
 @router.post("/offer")
-async def webrtc_offer(
-    request: Request,
-    db: AsyncSession = Depends(get_db)
-):
-    """Handle WebRTC offer from client"""
+async def webrtc_offer(request: Request, db: AsyncSession = Depends(get_db)):
+    """
+    Handle WebRTC offer from client
+    """
     try:
+        # Parse request data
         data = await request.json()
-        camera_id = data["cameraId"]
-        offer = RTCSessionDescription(sdp=data["sdp"], type="offer")
+        camera_id = data.get("cameraId")
+        sdp = data.get("sdp")
         
-        # Check if camera exists
+        if not camera_id or not sdp:
+            raise HTTPException(status_code=400, detail="Missing cameraId or SDP")
+        
+        # Check if camera exists in database
         camera = await db.get(Camera, camera_id)
         if camera is None:
             raise HTTPException(status_code=404, detail="Camera not found")
         
-        # Create peer connection
-        pc, pc_id = await create_peer_connection(camera_id)
+        # Debug log to see what's happening
+        logger.info(f"Processing WebRTC offer for camera {camera_id}")
         
-        # Set remote description
+        # Get camera manager
+        camera_manager = await get_camera_manager()
+        logger.info(f"Current cameras in manager: {list(camera_manager.cameras.keys())}")
+        
+        # Try to ensure camera is connected
+        # If it's not in the manager, this will try to add it
+        if not await camera_manager.ensure_camera_connected(camera_id):
+            logger.error(f"Failed to ensure camera {camera_id} is connected")
+            # Instead of raising error, try to add camera directly
+            success = await camera_manager.add_camera(camera, start_processing=False)
+            if not success:
+                raise HTTPException(status_code=500, detail="Failed to connect to camera")
+            logger.info(f"Added camera {camera_id} to manager")
+        
+        # Create peer connection
+        pc = RTCPeerConnection(
+            configuration=RTCConfiguration(
+                iceServers=[
+                    RTCIceServer(urls=["stun:stun.l.google.com:19302"]),
+                    RTCIceServer(urls=["stun:stun1.l.google.com:19302"])
+                ]
+            )
+        )
+        
+        # Generate a unique ID for this connection
+        pc_id = str(uuid.uuid4())
+        
+        # Create video track
+        video_track = CameraVideoStreamTrack(camera_id)
+        
+        # Add track to peer connection
+        pc.addTrack(video_track)
+        
+        # Store for cleanup
+        pcs[pc_id] = {"pc": pc, "camera_id": camera_id}
+        
+        # Handle connection state changes
+        @pc.on("connectionstatechange")
+        async def on_connectionstatechange():
+            logger.info(f"Connection state for {pc_id}: {pc.connectionState}")
+            if pc.connectionState == "failed" or pc.connectionState == "closed":
+                await cleanup_peer_connection(pc_id)
+        
+        # Parse and set remote description (client's offer)
+        offer = RTCSessionDescription(sdp=sdp, type="offer")
         await pc.setRemoteDescription(offer)
         
-        # Create answer
+        # Create answer with explicit direction to avoid the None error
+        # The key fix:
+        for transceiver in pc.getTransceivers():
+            if transceiver.direction is None:
+                transceiver.direction = "recvonly"
+        
         answer = await pc.createAnswer()
         await pc.setLocalDescription(answer)
         
+        # Return the answer
         return {
+            "type": pc.localDescription.type,
             "sdp": pc.localDescription.sdp,
-            "type": pc.localDescription.type
+            "session_id": pc_id
         }
         
     except Exception as e:
-        logger.exception(f"Error handling WebRTC offer: {str(e)}")
+        logger.exception(f"Error handling WebRTC offer: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.post("/ice-candidate")
-async def webrtc_ice_candidate(
-    request: Request,
-    db: AsyncSession = Depends(get_db)
-):
-    """Handle ICE candidate from client"""
+@router.post("/icecandidate/{session_id}")
+async def webrtc_ice_candidate(session_id: str, request: Request):
+    """
+    Handle ICE candidate from client
+    """
     try:
+        # Check if session exists
+        if session_id not in pcs:
+            return JSONResponse(status_code=404, content={"error": "Session not found"})
+        
+        # Get peer connection
+        pc = pcs[session_id]["pc"]
+        
+        # Parse candidate
         data = await request.json()
-        camera_id = data["cameraId"]
         
-        # Check if camera exists
-        camera = await db.get(Camera, camera_id)
-        if camera is None:
-            raise HTTPException(status_code=404, detail="Camera not found")
+        # Add candidate
+        candidate = data.get("candidate", "")
+        sdp_mid = data.get("sdpMid")
+        sdp_mline_index = data.get("sdpMLineIndex")
         
-        # Find corresponding peer connection
-        pc = None
-        for pc_id, candidate_pc in pcs.items():
-            if any(sender.track.camera_id == camera_id for sender in candidate_pc.getSenders()):
-                pc = candidate_pc
-                break
+        # Skip empty candidates
+        if not candidate:
+            return {"success": True}
         
-        if pc is None:
-            raise HTTPException(status_code=404, detail="Peer connection not found")
-        
-        # Add ICE candidate
-        candidate = data["candidate"]
-        sdp_mid = data["sdpMid"]
-        sdp_m_line_index = data["sdpMLineIndex"]
-        
+        # Add candidate to peer connection
         await pc.addIceCandidate({
             "candidate": candidate,
             "sdpMid": sdp_mid,
-            "sdpMLineIndex": sdp_m_line_index
+            "sdpMLineIndex": sdp_mline_index
         })
         
-        return {"message": "ICE candidate added"}
+        return {"success": True}
         
     except Exception as e:
-        logger.exception(f"Error handling ICE candidate: {str(e)}")
+        logger.exception(f"Error handling ICE candidate: {e}")
+        # Don't raise an exception for ICE candidate errors
+        return {"success": False, "error": str(e)}
+
+@router.delete("/session/{session_id}")
+async def close_session(session_id: str):
+    """
+    Close a WebRTC session
+    """
+    try:
+        # Check if session exists
+        if session_id not in pcs:
+            return {"message": "Session not found"}
+        
+        # Clean up
+        await cleanup_peer_connection(session_id)
+        
+        return {"message": "Session closed"}
+        
+    except Exception as e:
+        logger.exception(f"Error closing session: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.websocket("/snapshot/{camera_id}")
@@ -240,7 +300,9 @@ async def snapshot_endpoint(
     camera_id: int,
     db: AsyncSession = Depends(get_db)
 ):
-    """WebSocket endpoint for snapshot mode"""
+    """
+    WebSocket endpoint for snapshot mode
+    """
     try:
         # Accept connection
         await websocket.accept()
@@ -264,27 +326,13 @@ async def snapshot_endpoint(
             await websocket.close(code=4005, reason="Camera not available")
             return
         
-        # Get processor
-        processor = camera_manager.cameras.get(camera_id)
-        if not processor:
-            await websocket.close(code=4006, reason="Camera processor not found")
-            return
-        
-        # Get snapshot interval from settings
-        snapshot_interval = 1.0  # Default 1 second
-        try:
-            query = select(Settings).where(Settings.key == "idle_snapshot_interval")
-            result = await db.execute(query)
-            setting = result.scalar_one_or_none()
-            if setting:
-                snapshot_interval = float(setting.value)
-        except Exception as e:
-            logger.warning(f"Error getting snapshot interval: {str(e)}")
-        
+        # Snapshot interval
+        snapshot_interval = 1.0  # 1 second default
         last_snapshot_time = 0
-        ping_timeout = 30  # 30 seconds timeout for ping
+        ping_timeout = 30  # 30 seconds timeout
         last_ping_time = time.time()
         
+        # Main loop
         while True:
             try:
                 # Wait for message with timeout
@@ -293,7 +341,7 @@ async def snapshot_endpoint(
                     timeout=ping_timeout
                 )
                 
-                # Parse message
+                # Parse message as JSON
                 data = json.loads(message)
                 message_type = data.get("type")
                 
@@ -306,18 +354,16 @@ async def snapshot_endpoint(
                     current_time = time.time()
                     if current_time - last_snapshot_time >= snapshot_interval:
                         # Get latest frame
-                        frame_data = processor.get_latest_frame()
-                        if frame_data:
-                            frame, timestamp = frame_data
-                            
-                            # Convert to JPEG
-                            _, buffer = cv2.imencode('.jpg', frame)
-                            base64_image = base64.b64encode(buffer).decode('utf-8')
+                        jpeg_frame = await camera_manager.get_jpeg_frame(camera_id)
+                        
+                        if jpeg_frame:
+                            # Encode as base64
+                            base64_image = base64.b64encode(jpeg_frame).decode('utf-8')
                             
                             # Send snapshot
                             await websocket.send_json({
                                 "type": "snapshot",
-                                "timestamp": timestamp,
+                                "timestamp": current_time,
                                 "data": base64_image
                             })
                             
@@ -331,20 +377,21 @@ async def snapshot_endpoint(
                 continue
                 
             except WebSocketDisconnect:
+                logger.info(f"WebSocket disconnected for camera {camera_id}")
                 break
                 
             except Exception as e:
-                logger.exception(f"Error in snapshot websocket: {str(e)}")
+                logger.exception(f"Error in snapshot websocket: {e}")
                 break
     
     finally:
-        # Cleanup
+        # Clean up
         if camera_id in active_websockets:
             try:
                 active_websockets[camera_id].remove(websocket)
                 if not active_websockets[camera_id]:
                     del active_websockets[camera_id]
-            except ValueError:
+            except (ValueError, KeyError):
                 pass
         
         try:
@@ -354,7 +401,9 @@ async def snapshot_endpoint(
 
 @router.on_event("shutdown")
 async def shutdown_event():
-    """Cleanup resources on shutdown"""
+    """
+    Cleanup resources on shutdown
+    """
     # Close all peer connections
     for pc_id in list(pcs.keys()):
         await cleanup_peer_connection(pc_id)

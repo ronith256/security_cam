@@ -77,20 +77,25 @@ async def startup_event():
             
             # Initialize processing for each camera
             for camera in enabled_cameras:
-                # Check if camera should be processed
-                should_process = (
+                # Check if camera should be processed for AI
+                needs_ai_processing = (
                     camera.detect_people or 
                     camera.count_people or 
                     camera.recognize_faces or 
                     camera.template_matching
                 )
                 
-                if should_process:
-                    # Add camera to manager and start processing
+                if needs_ai_processing:
+                    # Add camera to manager and start AI processing
                     logger.info(f"Starting processing for camera {camera.id}: {camera.name}")
                     await camera_manager.add_camera(camera, start_processing=True)
                 else:
-                    logger.info(f"Camera {camera.id}: {camera.name} does not need processing")
+                    # Add camera to manager for streaming only
+                    logger.info(f"Adding camera {camera.id}: {camera.name} for streaming only")
+                    await camera_manager.add_camera(camera, start_processing=False)
+        
+        # Debug log of available cameras
+        logger.info(f"Available Cameras: {camera_manager.cameras.keys()}")
         
         logger.info("Application startup complete")
     

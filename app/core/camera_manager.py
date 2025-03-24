@@ -1,14 +1,13 @@
-import cv2
-import numpy as np
-import asyncio
 import logging
+import asyncio
 import time
-from typing import Dict, Optional, Tuple, List, Any
+from typing import Dict, List, Any, Optional, Tuple
 from datetime import datetime
-import threading
 from concurrent.futures import ThreadPoolExecutor
 
 from app.models.camera import Camera
+from app.models.settings import Settings
+from app.core.stream_processor import StreamProcessor
 from app.core.object_detection import ObjectDetector
 from app.core.face_recognition import FaceRecognizer
 from app.core.template_matching import TemplateMatcher
@@ -17,269 +16,103 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
-class CameraProcessor:
-    """Handles processing for a single camera stream"""
-    def __init__(
-        self, 
-        camera: Camera,
-        processing_fps: int = 5,
-        streaming_fps: int = 30
-    ):
-        self.camera = camera
-        self.camera_id = camera.id
-        self.rtsp_url = camera.rtsp_url
-        self.processing_fps = processing_fps
-        self.streaming_fps = streaming_fps
-        
-        # Feature flags
-        self.detect_people = camera.detect_people
-        self.count_people = camera.count_people
-        self.recognize_faces = camera.recognize_faces
-        self.template_matching = camera.template_matching
-        
-        # State variables
-        self.connected = False
-        self.processing = False
-        self.capture = None
-        self.last_frame = None
-        self.last_frame_time = 0
-        self.last_processed_time = 0
-        self.fps = 0
-        
-        # Processing components
-        self.object_detector = ObjectDetector() if self.detect_people else None
-        self.face_recognizer = FaceRecognizer() if self.recognize_faces else None
-        self.template_matcher = TemplateMatcher(camera.id) if self.template_matching else None
-        self.people_counter = PeopleCounter(camera.id) if self.count_people else None
-        
-        # Frame buffers
-        self.raw_frame_buffer = []
-        self.processed_frame_buffer = []
-        self.max_buffer_size = 30  # ~1 second at 30fps
-        
-        # Processing results
-        self.detection_results = {}
-        self.current_occupancy = 0
-        
-        # Lock for thread safety
-        self.lock = threading.Lock()
-    
-    async def connect(self) -> bool:
-        """Connect to the camera stream"""
-        try:
-            # Initialize video capture
-            self.capture = cv2.VideoCapture(self.rtsp_url)
-            if not self.capture.isOpened():
-                logger.error(f"Failed to open camera {self.camera_id}")
-                return False
-            
-            self.connected = True
-            logger.info(f"Connected to camera {self.camera_id}")
-            return True
-            
-        except Exception as e:
-            logger.exception(f"Error connecting to camera {self.camera_id}: {str(e)}")
-            return False
-    
-    async def disconnect(self):
-        """Disconnect from the camera stream"""
-        try:
-            self.connected = False
-            self.processing = False
-            
-            if self.capture:
-                self.capture.release()
-            
-            logger.info(f"Disconnected from camera {self.camera_id}")
-            
-        except Exception as e:
-            logger.exception(f"Error disconnecting camera {self.camera_id}: {str(e)}")
-    
-    async def process_frame(self, frame: np.ndarray) -> Tuple[np.ndarray, Dict[str, Any]]:
-        """Process a single frame with enabled AI components"""
-        try:
-            detection_results = {}
-            processed_frame = frame.copy()
-            
-            # Detect people
-            if self.detect_people and self.object_detector:
-                people = await self.object_detector.detect_people(frame)
-                detection_results['people'] = people
-                
-                # Update people counter if enabled
-                if self.count_people and self.people_counter:
-                    entry_count, exit_count, current_count = await self.people_counter.process_frame(
-                        frame, people
-                    )
-                    detection_results['occupancy'] = {
-                        'entries': entry_count,
-                        'exits': exit_count,
-                        'current': current_count
-                    }
-                    self.current_occupancy = current_count
-            
-            # Detect and recognize faces
-            if self.recognize_faces and self.face_recognizer:
-                faces = await self.face_recognizer.recognize_faces(frame, self.camera_id)
-                detection_results['faces'] = faces
-            
-            # Match templates
-            if self.template_matching and self.template_matcher:
-                templates = await self.template_matcher.match_templates(frame)
-                detection_results['templates'] = templates
-            
-            return processed_frame, detection_results
-            
-        except Exception as e:
-            logger.exception(f"Error processing frame for camera {self.camera_id}: {str(e)}")
-            return frame, {}
-    
-    async def capture_frames(self):
-        """Continuously capture frames from the camera"""
-        frame_interval = 1.0 / self.streaming_fps
-        last_capture_time = 0
-        
-        while self.connected:
-            try:
-                current_time = time.time()
-                
-                # Throttle frame capture to desired FPS
-                if current_time - last_capture_time < frame_interval:
-                    await asyncio.sleep(0.001)  # Small sleep to prevent CPU hogging
-                    continue
-                
-                # Capture frame
-                ret, frame = self.capture.read()
-                if not ret:
-                    logger.warning(f"Failed to read frame from camera {self.camera_id}")
-                    await asyncio.sleep(1)  # Wait before retrying
-                    continue
-                
-                # Update frame buffer
-                with self.lock:
-                    self.raw_frame_buffer.append((frame, current_time))
-                    while len(self.raw_frame_buffer) > self.max_buffer_size:
-                        self.raw_frame_buffer.pop(0)
-                
-                last_capture_time = current_time
-                
-            except Exception as e:
-                logger.exception(f"Error capturing frame from camera {self.camera_id}: {str(e)}")
-                await asyncio.sleep(1)
-    
-    async def process_frames(self):
-        """Continuously process captured frames"""
-        self.processing = True
-        process_interval = 1.0 / self.processing_fps
-        frames_processed = 0
-        start_time = time.time()
-        
-        while self.processing and self.connected:
-            try:
-                current_time = time.time()
-                
-                # Check if it's time to process the next frame
-                if current_time - self.last_processed_time < process_interval:
-                    await asyncio.sleep(0.001)
-                    continue
-                
-                # Get latest frame from buffer
-                frame_data = None
-                with self.lock:
-                    if self.raw_frame_buffer:
-                        frame_data = self.raw_frame_buffer[-1]
-                
-                if frame_data is None:
-                    await asyncio.sleep(0.01)
-                    continue
-                
-                frame, timestamp = frame_data
-                
-                # Process frame
-                processed_frame, results = await self.process_frame(frame)
-                
-                # Update processed frame buffer and results
-                with self.lock:
-                    self.processed_frame_buffer.append((processed_frame, current_time))
-                    while len(self.processed_frame_buffer) > self.max_buffer_size:
-                        self.processed_frame_buffer.pop(0)
-                    
-                    self.last_frame = processed_frame
-                    self.last_frame_time = current_time
-                    self.last_processed_time = current_time
-                    self.detection_results = results
-                
-                # Update FPS calculation
-                frames_processed += 1
-                elapsed_time = current_time - start_time
-                if elapsed_time >= 1.0:
-                    self.fps = frames_processed / elapsed_time
-                    frames_processed = 0
-                    start_time = current_time
-                
-            except Exception as e:
-                logger.exception(f"Error processing frames for camera {self.camera_id}: {str(e)}")
-                await asyncio.sleep(1)
-    
-    def get_latest_frame(self) -> Optional[Tuple[np.ndarray, float]]:
-        """Get the latest processed frame and its timestamp"""
-        with self.lock:
-            if self.processed_frame_buffer:
-                return self.processed_frame_buffer[-1]
-            elif self.raw_frame_buffer:
-                return self.raw_frame_buffer[-1]
-        return None
-    
-    def get_detection_results(self) -> Dict[str, Any]:
-        """Get the latest detection results"""
-        return self.detection_results
-    
-    def get_current_occupancy(self) -> int:
-        """Get the current room occupancy count"""
-        return self.current_occupancy
-
 class CameraManager:
-    """Manages multiple camera streams and their processing"""
+    """
+    Manages multiple camera streams and their processing components.
+    Provides a centralized interface for adding, removing, and controlling cameras.
+    """
     def __init__(self):
-        self.cameras: Dict[int, CameraProcessor] = {}
+        self.cameras: Dict[int, StreamProcessor] = {}
         self.executor = ThreadPoolExecutor(max_workers=4)
         self.initialized = False
+        
+        # Shared resources for efficiency
+        self.shared_object_detector = None
+        self.shared_face_recognizer = None
+        
+        # Status
+        self.status = "initializing"
+        self.start_time = time.time()
     
     async def initialize(self):
-        """Initialize the camera manager"""
-        if not self.initialized:
+        """Initialize the camera manager and shared resources"""
+        if self.initialized:
+            return
+        
+        try:
+            # Initialize shared object detector if we'll be using it
+            self.shared_object_detector = ObjectDetector()
+            
+            # Initialize shared face recognizer
+            self.shared_face_recognizer = FaceRecognizer()
+            
+            # Update status
             self.initialized = True
+            self.status = "ready"
             logger.info("Camera manager initialized")
+        
+        except Exception as e:
+            self.status = "error"
+            logger.exception(f"Failed to initialize camera manager: {str(e)}")
     
     async def add_camera(self, camera: Camera, start_processing: bool = True) -> bool:
-        """Add a new camera to the manager"""
+        """
+        Add a new camera to the manager
+        
+        Args:
+            camera: Camera model with configuration
+            start_processing: Whether to start processing immediately
+            
+        Returns:
+            Success flag
+        """
         try:
             # Check if camera already exists
             if camera.id in self.cameras:
                 logger.warning(f"Camera {camera.id} already exists in manager")
-                return True
+                return await self.update_camera(camera)
             
-            # Create camera processor
-            processor = CameraProcessor(
-                camera=camera,
+            # Initialize stream processor
+            processor = StreamProcessor(
+                camera_id=camera.id,
+                name=camera.name,
+                rtsp_url=camera.rtsp_url,
                 processing_fps=camera.processing_fps,
-                streaming_fps=camera.streaming_fps
+                streaming_fps=camera.streaming_fps,
+                detect_people=camera.detect_people,
+                count_people=camera.count_people,
+                recognize_faces=camera.recognize_faces,
+                template_matching=camera.template_matching
             )
             
-            # Connect to camera
+            # Assign AI components
+            if camera.detect_people:
+                processor.object_detector = self.shared_object_detector or ObjectDetector()
+            
+            if camera.count_people:
+                processor.people_counter = PeopleCounter(camera.id)
+            
+            if camera.recognize_faces:
+                processor.face_recognizer = self.shared_face_recognizer or FaceRecognizer()
+            
+            if camera.template_matching:
+                processor.template_matcher = TemplateMatcher(camera.id)
+            
+            # Connect to the camera stream
             if not await processor.connect():
-                logger.error(f"Failed to connect to camera {camera.id}")
+                logger.error(f"Failed to connect to camera {camera.id}: {camera.rtsp_url}")
                 return False
             
             # Add to managed cameras
             self.cameras[camera.id] = processor
             
             # Start capture and processing
-            asyncio.create_task(processor.capture_frames())
-            if start_processing:
-                asyncio.create_task(processor.process_frames())
+            await processor.start_capture()
             
-            logger.info(f"Added camera {camera.id} to manager")
+            if start_processing:
+                await processor.start_processing()
+            
+            logger.info(f"Added camera {camera.id}: {camera.name} to manager")
             return True
             
         except Exception as e:
@@ -287,12 +120,27 @@ class CameraManager:
             return False
     
     async def remove_camera(self, camera_id: int) -> bool:
-        """Remove a camera from the manager"""
+        """
+        Remove a camera from the manager
+        
+        Args:
+            camera_id: ID of the camera to remove
+            
+        Returns:
+            Success flag
+        """
         try:
             if camera_id in self.cameras:
                 processor = self.cameras[camera_id]
+                
+                # Stop processing and disconnect
+                await processor.stop_processing()
+                await processor.stop_capture()
                 await processor.disconnect()
+                
+                # Remove from managed cameras
                 del self.cameras[camera_id]
+                
                 logger.info(f"Removed camera {camera_id} from manager")
             return True
         except Exception as e:
@@ -300,37 +148,89 @@ class CameraManager:
             return False
     
     async def update_camera(self, camera: Camera) -> bool:
-        """Update camera settings"""
-        try:
-            # Remove existing camera
-            await self.remove_camera(camera.id)
+        """
+        Update camera settings
+        
+        Args:
+            camera: Updated camera configuration
             
-            # Add camera with new settings
-            return await self.add_camera(camera)
+        Returns:
+            Success flag
+        """
+        try:
+            # Check if the camera exists
+            if camera.id not in self.cameras:
+                logger.warning(f"Camera {camera.id} not found, adding instead of updating")
+                return await self.add_camera(camera)
+            
+            processor = self.cameras[camera.id]
+            
+            # Check if URL changed, requiring reconnection
+            if processor.rtsp_url != camera.rtsp_url:
+                await self.remove_camera(camera.id)
+                return await self.add_camera(camera)
+            
+            # Update settings
+            await processor.set_property("name", camera.name)
+            await processor.set_property("processing_fps", camera.processing_fps)
+            await processor.set_property("streaming_fps", camera.streaming_fps)
+            
+            # Update feature flags
+            await processor.set_property("detect_people", camera.detect_people)
+            await processor.set_property("count_people", camera.count_people) 
+            await processor.set_property("recognize_faces", camera.recognize_faces)
+            await processor.set_property("template_matching", camera.template_matching)
+            
+            # Update AI components
+            if camera.detect_people and not processor.object_detector:
+                processor.object_detector = self.shared_object_detector or ObjectDetector()
+            
+            if camera.count_people and not processor.people_counter:
+                processor.people_counter = PeopleCounter(camera.id)
+            
+            if camera.recognize_faces and not processor.face_recognizer:
+                processor.face_recognizer = self.shared_face_recognizer or FaceRecognizer()
+            
+            if camera.template_matching and not processor.template_matcher:
+                processor.template_matcher = TemplateMatcher(camera.id)
+            
+            logger.info(f"Updated camera {camera.id}: {camera.name}")
+            return True
+            
         except Exception as e:
             logger.exception(f"Error updating camera {camera.id}: {str(e)}")
             return False
     
     async def get_jpeg_frame(self, camera_id: int) -> Optional[bytes]:
-        """Get the latest frame from a camera as JPEG bytes"""
+        """
+        Get the latest frame from a camera as JPEG bytes
+        
+        Args:
+            camera_id: ID of the camera
+            
+        Returns:
+            JPEG encoded frame or None if not available
+        """
         try:
             if camera_id not in self.cameras:
                 return None
             
-            frame_data = self.cameras[camera_id].get_latest_frame()
-            if frame_data is None:
-                return None
-            
-            frame, _ = frame_data
-            _, jpeg_data = cv2.imencode('.jpg', frame)
-            return jpeg_data.tobytes()
+            return await self.cameras[camera_id].get_latest_frame_jpeg()
             
         except Exception as e:
             logger.exception(f"Error getting JPEG frame for camera {camera_id}: {str(e)}")
             return None
     
     async def ensure_camera_connected(self, camera_id: int) -> bool:
-        """Ensure a camera is connected and processing"""
+        """
+        Ensure a camera is connected and processing
+        
+        Args:
+            camera_id: ID of the camera
+            
+        Returns:
+            Connection status
+        """
         if camera_id not in self.cameras:
             return False
         
@@ -341,26 +241,98 @@ class CameraManager:
         return True
     
     async def set_camera_property(self, camera_id: int, property_name: str, value: Any) -> bool:
-        """Set a camera property"""
+        """
+        Set a camera processor property
+        
+        Args:
+            camera_id: ID of the camera
+            property_name: Name of the property to set
+            value: New property value
+            
+        Returns:
+            Success flag
+        """
         try:
             if camera_id not in self.cameras:
                 return False
             
-            processor = self.cameras[camera_id]
-            setattr(processor, property_name, value)
-            return True
+            return await self.cameras[camera_id].set_property(property_name, value)
             
         except Exception as e:
             logger.exception(f"Error setting camera property: {str(e)}")
             return False
     
+    async def apply_global_setting(self, setting_key: str, value: Any) -> bool:
+        """
+        Apply a global setting to all cameras
+        
+        Args:
+            setting_key: Setting key
+            value: Setting value
+            
+        Returns:
+            Success flag
+        """
+        try:
+            success = True
+            
+            # Apply to each camera based on setting type
+            for camera_id, processor in self.cameras.items():
+                if setting_key == "global_processing_fps":
+                    if not await processor.set_property("processing_fps", value):
+                        success = False
+                
+                elif setting_key == "detection_threshold" and processor.object_detector:
+                    processor.object_detector.set_threshold(value)
+                
+                elif setting_key == "face_recognition_threshold" and processor.face_recognizer:
+                    processor.face_recognizer.set_threshold(value)
+                
+                elif setting_key == "template_matching_threshold" and processor.template_matcher:
+                    processor.template_matcher.set_threshold(value)
+            
+            return success
+            
+        except Exception as e:
+            logger.exception(f"Error applying global setting {setting_key}: {str(e)}")
+            return False
+    
+    def get_camera_stats(self, camera_id: Optional[int] = None) -> Dict[int, Dict[str, Any]]:
+        """
+        Get statistics for one or all cameras
+        
+        Args:
+            camera_id: Optional camera ID, if None returns stats for all cameras
+            
+        Returns:
+            Dictionary of camera stats
+        """
+        stats = {}
+        
+        if camera_id is not None:
+            if camera_id in self.cameras:
+                stats[camera_id] = self.cameras[camera_id].get_stats()
+        else:
+            for camera_id, processor in self.cameras.items():
+                stats[camera_id] = processor.get_stats()
+        
+        return stats
+    
     async def shutdown(self):
         """Shutdown all cameras and release resources"""
         try:
+            # Stop and disconnect all cameras
             for camera_id in list(self.cameras.keys()):
                 await self.remove_camera(camera_id)
             
+            # Release shared resources
+            self.shared_object_detector = None
+            self.shared_face_recognizer = None
+            
+            # Shutdown thread pool
             self.executor.shutdown(wait=True)
+            
+            self.status = "shutdown"
             logger.info("Camera manager shutdown complete")
             
         except Exception as e:
