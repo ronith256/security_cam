@@ -103,39 +103,6 @@ async def delete_camera(
     
     return {"message": f"Camera {camera_id} deleted successfully"}
 
-@router.get("/{camera_id}/stream")
-async def stream_camera(
-    camera_id: int,
-    db: AsyncSession = Depends(get_db)
-):
-    """Stream camera as MJPEG"""
-    # Check if camera exists
-    camera = await db.get(Camera, camera_id)
-    if camera is None:
-        raise HTTPException(status_code=404, detail="Camera not found")
-    
-    # Get camera manager
-    camera_manager = await get_camera_manager()
-    
-    async def generate_frames():
-        while True:
-            jpeg_frame = await camera_manager.get_jpeg_frame(camera_id)
-            if jpeg_frame is None:
-                # If no frame is available, wait and try again
-                await asyncio.sleep(0.1)
-                continue
-            
-            yield (
-                b'--frame\r\n'
-                b'Content-Type: image/jpeg\r\n\r\n' + jpeg_frame + b'\r\n'
-            )
-            # Control the frame rate
-            await asyncio.sleep(1 / camera.streaming_fps)
-    
-    return Response(
-        content=generate_frames(),
-        media_type="multipart/x-mixed-replace; boundary=frame"
-    )
 
 @router.get("/{camera_id}/snapshot")
 async def get_camera_snapshot(
