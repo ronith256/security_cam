@@ -4,6 +4,7 @@ import { Link } from 'react-router-dom';
 import { Camera, Play, Pause, Eye, Edit, Trash2 } from 'lucide-react';
 import Card from '../common/Card';
 import Button from '../common/Button';
+import RTSPStreamViewer from './RTSPStreamViewer';
 import { Camera as CameraType } from '../../types/camera';
 import { updateCamera, deleteCamera } from '../../api/cameras';
 import { useApi } from '../../hooks/useApi';
@@ -23,6 +24,7 @@ const CameraCard: React.FC<CameraCardProps> = ({
   onConnectionChange
 }) => {
   const [isEnabled, setIsEnabled] = useState(camera.enabled);
+  const [isStreamVisible, setIsStreamVisible] = useState(false);
   const { showToast } = useToast();
 
   const { execute: executeUpdate, isLoading: isUpdating } = useApi(updateCamera, {
@@ -65,15 +67,43 @@ const CameraCard: React.FC<CameraCardProps> = ({
     >
       <div className="flex flex-col h-full">
         <div className="mb-4 bg-gray-100 h-40 rounded-md flex items-center justify-center relative">
-          {camera.enabled ? (
-            <Link 
-              to={`/cameras/${camera.id}`} 
-              className="absolute inset-0 flex items-center justify-center bg-black bg-opacity-50 opacity-0 hover:opacity-100 transition-opacity rounded-md"
-            >
-              <Button variant="primary" size="sm" icon={<Eye size={16} />}>
-                View
+          {camera.enabled && isStreamVisible ? (
+            <div className="w-full h-full">
+              <RTSPStreamViewer
+                cameraId={camera.id}
+                rtspUrl={camera.rtsp_url}
+                height="h-40"
+                onReady={() => handleConnectionChange(true)}
+                onError={() => handleConnectionChange(false)}
+                fallbackToWebRTC={true}
+              />
+              <div className="absolute top-2 right-2">
+                <Button 
+                  variant="secondary" 
+                  size="sm" 
+                  onClick={() => setIsStreamVisible(false)}
+                  className="bg-gray-800 bg-opacity-75 text-white"
+                >
+                  Hide
+                </Button>
+              </div>
+            </div>
+          ) : camera.enabled ? (
+            <div className="flex flex-col items-center">
+              <Button 
+                variant="secondary" 
+                size="sm"
+                onClick={() => setIsStreamVisible(true)}
+              >
+                Preview Stream
               </Button>
-            </Link>
+              <Link 
+                to={`/cameras/${camera.id}`} 
+                className="mt-2 text-sm text-blue-600 hover:underline"
+              >
+                Full View
+              </Link>
+            </div>
           ) : (
             <div className="text-gray-400 flex flex-col items-center justify-center">
               <Camera size={32} />
@@ -106,25 +136,40 @@ const CameraCard: React.FC<CameraCardProps> = ({
             {isEnabled ? 'Disable' : 'Enable'}
           </Button>
           
-          <Link to={`/cameras/${camera.id}/edit`} className="ml-auto">
-            <Button
-              variant="secondary"
-              size="sm"
-              icon={<Edit size={16} />}
-            >
-              Edit
-            </Button>
-          </Link>
+          {isEnabled && (
+            <Link to={`/cameras/${camera.id}`}>
+              <Button
+                variant="primary"
+                size="sm"
+                icon={<Eye size={16} />}
+              >
+                View
+              </Button>
+            </Link>
+          )}
           
-          <Button
-            variant="danger"
-            size="sm"
-            onClick={handleDelete}
-            isLoading={isDeleting}
-            icon={<Trash2 size={16} />}
-          >
-            Delete
-          </Button>
+          <div className="flex ml-auto">
+            <Link to={`/cameras/${camera.id}/edit`}>
+              <Button
+                variant="secondary"
+                size="sm"
+                icon={<Edit size={16} />}
+                className="mr-2"
+              >
+                Edit
+              </Button>
+            </Link>
+            
+            <Button
+              variant="danger"
+              size="sm"
+              onClick={handleDelete}
+              isLoading={isDeleting}
+              icon={<Trash2 size={16} />}
+            >
+              Delete
+            </Button>
+          </div>
         </div>
       </div>
     </Card>

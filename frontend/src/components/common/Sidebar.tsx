@@ -8,6 +8,9 @@ import {
   Users, 
   UserPlus, 
   Settings,
+  Bell,
+  AlertTriangle,
+  List
 } from 'lucide-react';
 
 const Sidebar: React.FC = () => {
@@ -80,7 +83,56 @@ const Sidebar: React.FC = () => {
               <span>Face Recognition</span>
             </NavLink>
           </li>
+          
+          {/* Notifications section */}
+          <li className="pt-4 mt-4 border-t border-gray-700">
+            <h3 className="px-3 text-xs font-semibold text-gray-400 uppercase tracking-wider">
+              Notifications
+            </h3>
+          </li>
           <li>
+            <NavLink 
+              to="/notifications" 
+              className={({ isActive }) => 
+                `flex items-center p-3 rounded-lg transition-colors ${
+                  isActive ? 'bg-blue-600' : 'hover:bg-gray-800'
+                }`
+              }
+              end // Only active when path is exactly '/notifications'
+            >
+              <Bell className="mr-3" size={20} />
+              <span>Dashboard</span>
+            </NavLink>
+          </li>
+          <li>
+            <NavLink 
+              to="/notifications/triggers" 
+              className={({ isActive }) => 
+                `flex items-center p-3 rounded-lg transition-colors ${
+                  isActive ? 'bg-blue-600' : 'hover:bg-gray-800'
+                }`
+              }
+            >
+              <AlertTriangle className="mr-3" size={20} />
+              <span>Triggers</span>
+            </NavLink>
+          </li>
+          <li>
+            <NavLink 
+              to="/notifications/events" 
+              className={({ isActive }) => 
+                `flex items-center p-3 rounded-lg transition-colors ${
+                  isActive ? 'bg-blue-600' : 'hover:bg-gray-800'
+                }`
+              }
+            >
+              <List className="mr-3" size={20} />
+              <span>Event History</span>
+            </NavLink>
+          </li>
+          
+          {/* Settings */}
+          <li className="pt-4 mt-4 border-t border-gray-700">
             <NavLink 
               to="/settings" 
               className={({ isActive }) => 

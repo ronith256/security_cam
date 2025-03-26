@@ -5,7 +5,7 @@ import { Edit, ArrowLeft, Image, Activity } from 'lucide-react';
 import PageHeader from '../components/common/PageHeader';
 import Button from '../components/common/Button';
 import Card from '../components/common/Card';
-import WebRTCStream from '../components/cameras/WebRTCStream';
+import RTSPStreamViewer from '../components/cameras/RTSPStreamViewer';
 import CameraStats from '../components/cameras/CameraStats';
 import FaceDetections from '../components/faces/FaceDetections';
 import TemplateList from '../components/templates/TemplateList';
@@ -205,18 +205,20 @@ const CameraDetail: React.FC = () => {
                 variant="secondary"
                 size="sm"
                 icon={<Activity size={16} />}
-                onClick={() => showToast('Live feed is using high-quality WebRTC streaming', 'info')}
+                onClick={() => showToast('Direct RTSP streaming from camera', 'info')}
               >
-                High Quality
+                Direct RTSP
               </Button>
             }
           >
             <div className="flex-grow">
-              <WebRTCStream 
-                cameraId={cameraId} 
-                height="h-96" 
-                onConnectionChange={handleStreamConnection}
-                highQuality={true} // Force high-quality WebRTC in detailed view
+              <RTSPStreamViewer 
+                cameraId={cameraId}
+                rtspUrl={camera.rtsp_url}
+                height="h-96"
+                onReady={() => handleStreamConnection(true)}
+                onError={() => handleStreamConnection(false)}
+                fallbackToWebRTC={true}
               />
             </div>
           </Card>
