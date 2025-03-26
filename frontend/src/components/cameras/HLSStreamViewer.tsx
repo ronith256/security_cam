@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import ReactPlayer from 'react-player';
-import { Loader2, AlertTriangle } from 'lucide-react';
+import { Loader2, AlertTriangle, RefreshCw } from 'lucide-react';
 import Button from '../common/Button';
 import { apiBaseUrl } from '../../api';
 import axios from 'axios';
@@ -28,9 +28,13 @@ const HLSStreamViewer: React.FC<HLSStreamViewerProps> = ({
   const [sessionId, setSessionId] = useState<string | null>(null);
   const playerRef = useRef<ReactPlayer | null>(null);
   const streamCheckInterval = useRef<NodeJS.Timeout | null>(null);
+  const retryCount = useRef(0);
+  const isMounted = useRef(true);
 
   // Function to start HLS stream
   const startHLSStream = async () => {
+    if (!isMounted.current) return;
+    
     setIsLoading(true);
     setError(null);
     
@@ -38,14 +42,18 @@ const HLSStreamViewer: React.FC<HLSStreamViewerProps> = ({
       // Request a new HLS stream for this camera
       const response = await axios.post(`${apiBaseUrl}/hls/start/${cameraId}`);
       
+      if (!isMounted.current) return;
+      
       if (response.data && response.data.url) {
         console.log(`Received HLS stream URL: ${response.data.url}`);
-        // Actual URL that will be used by ReactPlayer
-        console.log(`Full stream URL to be used: ${response.data.url}`);
-        setStreamUrl(response.data.url);
+        
+        // Add timestamp to URL to prevent caching issues
+        const timestamp = new Date().getTime();
+        const streamUrlWithTimestamp = `${response.data.url}?t=${timestamp}`;
+        console.log(`Full stream URL with timestamp: ${streamUrlWithTimestamp}`);
+        
+        setStreamUrl(streamUrlWithTimestamp);
         setSessionId(response.data.session_id);
-        setIsLoading(false);
-        if (onReady) onReady();
         
         // Start a periodic keep-alive request to prevent stream termination
         if (streamCheckInterval.current) {
@@ -53,13 +61,17 @@ const HLSStreamViewer: React.FC<HLSStreamViewerProps> = ({
         }
         
         streamCheckInterval.current = setInterval(() => {
-          axios.post(`${apiBaseUrl}/hls/keepalive/${response.data.session_id}`)
-            .catch(error => console.error('Error sending keepalive:', error));
+          if (isMounted.current && response.data.session_id) {
+            axios.post(`${apiBaseUrl}/hls/keepalive/${response.data.session_id}`)
+              .catch(error => console.error('Error sending keepalive:', error));
+          }
         }, 30000); // Every 30 seconds
       } else {
-        handleError(new Error('Failed to get stream URL'));
+        handleError(new Error('Failed to get stream URL from server'));
       }
     } catch (err) {
+      if (!isMounted.current) return;
+      
       const errorMessage = err instanceof Error ? err.message : 'Failed to start stream';
       console.error('Stream error:', err);
       handleError(new Error(errorMessage));
@@ -68,6 +80,8 @@ const HLSStreamViewer: React.FC<HLSStreamViewerProps> = ({
 
   // Function to handle errors
   const handleError = (err: Error) => {
+    if (!isMounted.current) return;
+    
     console.error('Stream error:', err);
     setError(err);
     setIsLoading(false);
@@ -79,19 +93,57 @@ const HLSStreamViewer: React.FC<HLSStreamViewerProps> = ({
 
   // Function to handle player ready
   const handleReady = () => {
+    if (!isMounted.current) return;
+    
+    console.log('ReactPlayer is ready');
     setIsLoading(false);
-    if (onReady) onReady();
+    retryCount.current = 0;
+    
+    if (onReady) {
+      onReady();
+    }
+  };
+
+  // Function to handle player errors with retry logic
+  const handlePlayerError = (e: any) => {
+    console.error('ReactPlayer error:', e);
+    
+    // Try to reload if we have retries left
+    if (retryCount.current < 3) {
+      retryCount.current++;
+      console.log(`Retrying stream (${retryCount.current}/3)...`);
+      
+      // Short delay before retry
+      setTimeout(() => {
+        if (!isMounted.current) return;
+        
+        // Add new timestamp to force reload
+        if (streamUrl) {
+          const baseUrl = streamUrl.split('?')[0];
+          const newUrl = `${baseUrl}?t=${new Date().getTime()}`;
+          setStreamUrl(newUrl);
+        } else {
+          startHLSStream();
+        }
+      }, 2000);
+    } else {
+      handleError(new Error('Failed to play stream after multiple attempts'));
+    }
   };
 
   // Set up the stream when component mounts
   useEffect(() => {
+    isMounted.current = true;
     startHLSStream();
     
     // Cleanup function
     return () => {
+      isMounted.current = false;
+      
       // Stop the keepalive interval
       if (streamCheckInterval.current) {
         clearInterval(streamCheckInterval.current);
+        streamCheckInterval.current = null;
       }
       
       // Terminate the stream session if we have one
@@ -125,8 +177,10 @@ const HLSStreamViewer: React.FC<HLSStreamViewerProps> = ({
           onClick={() => {
             setError(null);
             setIsLoading(true);
+            retryCount.current = 0;
             startHLSStream();
           }}
+          icon={<RefreshCw size={16} />}
         >
           Retry
         </Button>
@@ -145,10 +199,7 @@ const HLSStreamViewer: React.FC<HLSStreamViewerProps> = ({
           playing
           controls={false}
           onReady={handleReady}
-          onError={(e) => {
-            console.error('ReactPlayer error:', e);
-            handleError(new Error('Failed to play stream'));
-          }}
+          onError={handlePlayerError}
           onBuffer={() => setIsLoading(true)}
           onBufferEnd={() => setIsLoading(false)}
           config={{
@@ -182,4 +233,4 @@ const HLSStreamViewer: React.FC<HLSStreamViewerProps> = ({
   );
 };
 
-export default HLSStreamViewer; 
+export default HLSStreamViewer;

@@ -14,9 +14,9 @@ from starlette.responses import FileResponse
 
 # Setup detailed logging
 logger = setup_logging(
-    log_file="cctv_monitoring.log", 
+    # log_file="cctv_monitoring.log", 
     console_level=logging.INFO, 
-    file_level=logging.DEBUG
+    # file_level=logging.DEBUG
 )
 
 # Create the FastAPI app
@@ -45,27 +45,9 @@ app.include_router(app_settings.router, prefix="/api/settings", tags=["settings"
 app.include_router(notifications.router, prefix="/api/notifications", tags=["notifications"])
 app.include_router(hls.router, prefix="/api/hls", tags=["hls"])
 
-# Mount static files for storing images, templates, snapshots, etc.
-# Add CORS headers for static files
-class StaticFilesCORS(StaticFiles):
-    """Custom StaticFiles class that adds CORS headers"""
-    async def __call__(self, scope, receive, send):
-        """Add CORS headers to static file responses"""
-        # Add CORS headers to the response
-        async def wrapped_send(message):
-            if message['type'] == 'http.response.start':
-                # Add CORS headers
-                headers = list(message.get('headers', []))
-                headers.append((b'Access-Control-Allow-Origin', b'*'))
-                headers.append((b'Access-Control-Allow-Methods', b'GET, HEAD, OPTIONS'))
-                headers.append((b'Access-Control-Allow-Headers', b'*'))
-                message['headers'] = headers
-            await send(message)
-            
-        await super().__call__(scope, receive, wrapped_send)
-
-# Mount custom static files middleware with CORS support
-app.mount("/static", StaticFilesCORS(directory="static"), name="static")
+# Use regular StaticFiles instead of custom StaticFilesCORS
+# The global CORS middleware will handle the CORS headers
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
 @app.on_event("startup")
 async def startup_event():

@@ -3,11 +3,13 @@ import logging
 import os
 import subprocess
 import time
-from typing import Dict, Optional, List
+import sys
+from typing import Dict, Optional, List, Tuple
 import uuid
 from fastapi import APIRouter, HTTPException, Depends, BackgroundTasks
 from sqlalchemy.ext.asyncio import AsyncSession
 from pydantic import BaseModel
+import asyncio
 
 from app.database import get_db
 from app.models.camera import Camera
@@ -15,6 +17,21 @@ from app.config import settings
 
 # Configure logger
 logger = logging.getLogger(__name__)
+
+# Create a specific logger for FFmpeg output
+ffmpeg_logger = logging.getLogger("ffmpeg")
+ffmpeg_logger.setLevel(logging.DEBUG)
+
+# Create ffmpeg logs directory if it doesn't exist
+FFMPEG_LOGS_DIR = "logs/ffmpeg"
+os.makedirs(FFMPEG_LOGS_DIR, exist_ok=True)
+
+# Add a file handler for FFmpeg logs
+ffmpeg_handler = logging.FileHandler(os.path.join(FFMPEG_LOGS_DIR, "ffmpeg.log"))
+ffmpeg_handler.setLevel(logging.DEBUG)
+ffmpeg_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+ffmpeg_handler.setFormatter(ffmpeg_formatter)
+ffmpeg_logger.addHandler(ffmpeg_handler)
 
 router = APIRouter()
 
@@ -100,25 +117,57 @@ async def cleanup_process(session_id: str):
     
     # Clean up HLS files if they exist
     try:
-        hls_dir = os.path.join(settings.HLS_DIR, session_id)
-        hls_file = os.path.join(settings.HLS_DIR, f"{session_id}.m3u8")
+        session_dir = os.path.join(settings.HLS_DIR, session_id)
         access_file = os.path.join(settings.HLS_DIR, f"{session_id}.access")
         
         # Remove segment directory if it exists
-        if os.path.exists(hls_dir):
-            for file in os.listdir(hls_dir):
-                os.remove(os.path.join(hls_dir, file))
-            os.rmdir(hls_dir)
-            
-        # Remove playlist file if it exists
-        if os.path.exists(hls_file):
-            os.remove(hls_file)
+        if os.path.exists(session_dir):
+            for file in os.listdir(session_dir):
+                os.remove(os.path.join(session_dir, file))
+            os.rmdir(session_dir)
             
         # Remove access file if it exists
         if os.path.exists(access_file):
             os.remove(access_file)
     except Exception as e:
         logger.error(f"Error cleaning up HLS files: {str(e)}")
+
+
+async def read_ffmpeg_output(process, session_id):
+    """Read and log FFmpeg's stdout and stderr output"""
+    log_file_path = os.path.join(FFMPEG_LOGS_DIR, f"{session_id}.log")
+    
+    with open(log_file_path, 'w') as log_file:
+        # Write header info
+        log_file.write(f"=== FFmpeg Output for Session {session_id} ===\n")
+        log_file.write(f"Started at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+        log_file.flush()
+        
+        # Create async file readers
+        async def read_stream(stream, prefix):
+            while True:
+                line = await stream.readline()
+                if not line:
+                    break
+                decoded_line = line.decode('utf-8', errors='replace').rstrip()
+                
+                # Log to both the session-specific log file and the FFmpeg logger
+                log_file.write(f"[{prefix}] {decoded_line}\n")
+                log_file.flush()
+                
+                ffmpeg_logger.debug(f"[{session_id}] {prefix}: {decoded_line}")
+        
+        # Create tasks to read stdout and stderr
+        stdout_task = asyncio.create_task(read_stream(process.stdout, "stdout"))
+        stderr_task = asyncio.create_task(read_stream(process.stderr, "stderr"))
+        
+        # Wait for both tasks to complete
+        await asyncio.gather(stdout_task, stderr_task)
+        
+        # Add a completion message
+        completion_msg = f"\nProcess exited with return code: {process.returncode}\n"
+        log_file.write(completion_msg)
+        ffmpeg_logger.info(f"[{session_id}] {completion_msg}")
 
 
 async def start_hls_stream(camera_id: int, rtsp_url: str, session_id: str) -> bool:
@@ -128,53 +177,65 @@ async def start_hls_stream(camera_id: int, rtsp_url: str, session_id: str) -> bo
         output_dir = settings.HLS_DIR
         os.makedirs(output_dir, exist_ok=True)
         
-        # Define unique output paths for this session
-        hls_path = os.path.join(output_dir, f"{session_id}.m3u8")
-        hls_dir = os.path.join(output_dir, session_id)
-        os.makedirs(hls_dir, exist_ok=True)
+        # Create a dedicated directory for this session
+        session_dir = os.path.join(output_dir, session_id)
+        os.makedirs(session_dir, exist_ok=True)
+        
+        # Define playlist path inside the session directory
+        playlist_path = os.path.join(session_dir, "index.m3u8")
         
         # Debug log for file paths
-        logger.info(f"HLS path: {hls_path}")
-        logger.info(f"HLS directory: {hls_dir}")
-        logger.info(f"Directory exists: {os.path.exists(hls_dir)}")
+        logger.info(f"HLS directory: {session_dir}")
+        logger.info(f"Playlist path: {playlist_path}")
+        logger.info(f"FFmpeg log will be in: {os.path.join(FFMPEG_LOGS_DIR, f'{session_id}.log')}")
         
-        # Access controls for HLS
+        # Access controls for HLS (optional)
         access_file = os.path.join(output_dir, f"{session_id}.access")
         with open(access_file, 'w') as f:
             f.write(session_id)
         
-        # FFmpeg command to convert RTSP to HLS
-        # Use hardware acceleration if available (this will fall back to software encoding if hardware not available)
+        # Improved FFmpeg command with more explicit transcoding options
         command = [
             settings.FFMPEG_PATH,
-            "-y",                             # Overwrite output files without asking
-            "-loglevel", "warning",          # Show warnings and errors for better debugging
-            "-rtsp_transport", "tcp",         # Use TCP for RTSP (more reliable)
-            "-i", rtsp_url,                   # Input RTSP URL
-            "-c:v", "libx264",                # Use H.264 video codec
-            "-preset", "ultrafast",           # Use ultrafast preset for low latency
-            "-tune", "zerolatency",           # Tune for minimal latency
-            "-bufsize", settings.FFMPEG_BUFFER_SIZE,  # Buffer size
-            "-c:a", "aac",                    # Audio codec (if any)
-            "-ac", "2",                       # Two audio channels
-            "-ar", "44100",                   # Audio sample rate
-            "-f", "hls",                      # HLS output format
-            "-hls_time", str(settings.HLS_SEGMENT_TIME),  # Segment length in seconds
-            "-hls_list_size", str(settings.HLS_LIST_SIZE),  # Number of segments to keep in playlist
-            "-hls_flags", "delete_segments+independent_segments+discont_start",
-            "-hls_segment_type", "mpegts",    # Use MPEG-TS segment type
-            "-start_number", "0",             # Start segment numbering at 0
-            "-hls_segment_filename", f"{hls_dir}/%d.ts",  # Segment file pattern
-            hls_path                          # Output path
+            '-loglevel', 'debug',         # Show detailed logs for debugging
+            '-rtsp_transport', 'tcp',     # Use TCP for RTSP (more reliable)
+            '-i', rtsp_url,               # Input RTSP URL
+            '-c:v', 'libx264',            # Re-encode with H.264 instead of copy
+            '-profile:v', 'baseline',     # Use baseline profile for compatibility
+            '-level', '3.0',              # H.264 level
+            '-preset', 'ultrafast',       # Fast encoding
+            '-tune', 'zerolatency',       # Minimize latency
+            '-r', '15',                   # Output frame rate
+            '-g', '30',                   # GOP size 
+            '-sc_threshold', '0',         # Disable scene detection
+            '-b:v', '1000k',              # Video bitrate
+            '-bufsize', '1500k',          # Buffer size
+            '-maxrate', '1500k',          # Max bitrate
+            '-an',                        # No audio
+            '-f', 'hls',                  # HLS output format
+            '-hls_time', '2',             # Segment length in seconds
+            '-hls_list_size', '3',        # Number of segments in playlist
+            '-hls_flags', 'delete_segments+append_list',
+            '-hls_segment_type', 'mpegts', # Use MPEG-TS segment type
+            '-hls_segment_filename', f"{session_dir}/%d.ts",  # Segment filename pattern
+            playlist_path                 # Output playlist path
         ]
         
-        # Start FFmpeg process
-        process = subprocess.Popen(
-            command,
+        # Log the exact command for debugging
+        full_command = " ".join(command)
+        logger.info(f"Starting FFmpeg with command: {full_command}")
+        
+        # Start FFmpeg process with pipe for stdout and stderr
+        process = await asyncio.create_subprocess_exec(
+            *command,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            bufsize=10**8
+            bufsize=0,  # Unbuffered
+            text=False  # Binary mode
         )
+        
+        # Start a task to read FFmpeg output
+        asyncio.create_task(read_ffmpeg_output(process, session_id))
         
         # Store process
         active_processes[session_id] = process
@@ -184,8 +245,8 @@ async def start_hls_stream(camera_id: int, rtsp_url: str, session_id: str) -> bo
             "camera_id": camera_id,
             "start_time": time.time(),
             "last_activity": time.time(),
-            "hls_path": hls_path,
-            "hls_url": f"/static/hls/{session_id}.m3u8",
+            "playlist_path": playlist_path,
+            "hls_url": f"/static/hls/{session_id}/index.m3u8",  # Updated URL path
             "rtsp_url": rtsp_url
         }
         
@@ -198,20 +259,20 @@ async def start_hls_stream(camera_id: int, rtsp_url: str, session_id: str) -> bo
         camera_connections[camera_id].append(session_id)
         
         # Wait a bit for FFmpeg to start
-        await asyncio.sleep(2)
+        await asyncio.sleep(5)  # Increased wait time to 5 seconds
+            
+        # Check if playlist file was created (with retries)
+        retry_count = 0
+        max_retries = 5
+        while not os.path.exists(playlist_path) and retry_count < max_retries:
+            await asyncio.sleep(1)
+            retry_count += 1
+            logger.info(f"Waiting for playlist file to be created (attempt {retry_count}/{max_retries})")
         
-        # Check if process is still running
-        if process.poll() is not None:
-            # Process terminated
-            stderr = process.stderr.read().decode() if process.stderr else "No error output"
-            logger.error(f"FFmpeg process terminated: {stderr}")
+        if not os.path.exists(playlist_path):
+            logger.error(f"HLS playlist file was not created: {playlist_path}")
             await cleanup_process(session_id)
             return False
-            
-        # Verify HLS files were created
-        if not os.path.exists(hls_path):
-            logger.error(f"HLS playlist file was not created: {hls_path}")
-            # Don't immediately clean up - wait for potential delayed file creation
             
         logger.info(f"Started HLS stream for camera {camera_id} with session {session_id}")
         return True
@@ -270,7 +331,7 @@ async def start_stream(
     # Return stream information
     return {
         "session_id": session_id,
-        "url": f"{settings.API_URL}/static/hls/{session_id}.m3u8",
+        "url": f"{settings.API_URL}/static/hls/{session_id}/index.m3u8",
         "camera_id": camera_id,
         "start_time": time.time()
     }
@@ -319,7 +380,24 @@ async def stream_status(session_id: str):
     }
 
 
+# Debug endpoint to get FFmpeg logs for a session
+@router.get("/logs/{session_id}")
+async def get_ffmpeg_logs(session_id: str):
+    """Get FFmpeg logs for a specific session"""
+    log_path = os.path.join(FFMPEG_LOGS_DIR, f"{session_id}.log")
+    
+    if not os.path.exists(log_path):
+        raise HTTPException(status_code=404, detail="Logs not found for this session")
+    
+    try:
+        with open(log_path, 'r') as f:
+            logs = f.read()
+        
+        return {"session_id": session_id, "logs": logs}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error reading logs: {str(e)}")
+
+
 # Start background task to clean up expired sessions
 async def start_cleanup_task():
     """Start the background task to clean up expired sessions"""
-    asyncio.create_task(cleanup_expired_sessions()) 
