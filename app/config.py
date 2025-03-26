@@ -9,6 +9,7 @@ class Settings(BaseSettings):
     APP_NAME: str = "CCTV Monitoring System"
     DEBUG: bool = os.getenv("DEBUG", "False").lower() == "true"
     PORT: int = int(os.getenv("PORT", "8000"))
+    API_URL: str = os.getenv("API_URL", "http://localhost:8000")
     
     # Database settings
     DATABASE_URL: str = os.getenv("DATABASE_URL", "sqlite:///./cctv_monitoring.db")
@@ -44,6 +45,17 @@ class Settings(BaseSettings):
     TEMPLATES_DIR: str = f"{STATIC_DIR}/templates"
     FACES_DIR: str = f"{STATIC_DIR}/faces"
     SNAPSHOTS_DIR: str = f"{STATIC_DIR}/snapshots"
+    RECORDINGS_DIR: str = f"{STATIC_DIR}/recordings"
+    
+    # Email settings for notifications
+    SMTP_HOST: str = os.getenv("SMTP_HOST", "smtp.gmail.com")
+    SMTP_PORT: int = int(os.getenv("SMTP_PORT", "587"))
+    SMTP_USERNAME: str = os.getenv("SMTP_USERNAME", "")
+    SMTP_PASSWORD: str = os.getenv("SMTP_PASSWORD", "")
+    EMAIL_FROM: str = os.getenv("EMAIL_FROM", "")
+    
+    # Telegram settings for notifications
+    TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
     
     class Config:
         env_file = ".env"
@@ -57,4 +69,5 @@ os.makedirs(settings.STATIC_DIR, exist_ok=True)
 os.makedirs(settings.TEMPLATES_DIR, exist_ok=True)
 os.makedirs(settings.FACES_DIR, exist_ok=True)
 os.makedirs(settings.SNAPSHOTS_DIR, exist_ok=True)
+os.makedirs(settings.RECORDINGS_DIR, exist_ok=True)
 os.makedirs(settings.MODELS_DIR, exist_ok=True)

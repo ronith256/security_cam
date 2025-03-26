@@ -7,10 +7,12 @@ from sqlalchemy import select, update, delete
 from typing import List, Optional, Dict, Any
 import asyncio
 import logging
+import base64
 
 from app.database import get_db
-from app.models.camera import Camera, CameraCreate, CameraUpdate, CameraResponse
+from app.models.camera import Camera, CameraCreate, CameraUpdate, CameraResponse, CameraStreamInfo
 from app.core.camera_manager import get_camera_manager
+from app.config import settings
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -103,13 +105,54 @@ async def delete_camera(
     
     return {"message": f"Camera {camera_id} deleted successfully"}
 
+@router.get("/{camera_id}/stream", response_model=CameraStreamInfo)
+async def get_camera_stream_info(
+    camera_id: int,
+    db: AsyncSession = Depends(get_db)
+):
+    """Get stream information for a camera including RTSP URL for direct streaming"""
+    # Check if camera exists
+    camera = await db.get(Camera, camera_id)
+    if camera is None:
+        raise HTTPException(status_code=404, detail="Camera not found")
+    
+    # Get camera manager
+    camera_manager = await get_camera_manager()
+    
+    # Check if camera is active in manager
+    is_processing = camera_id in camera_manager.cameras
+    
+    # Get camera stats
+    stats = {
+        "processing_fps": 0,
+        "features": {
+            "detect_people": camera.detect_people,
+            "count_people": camera.count_people,
+            "recognize_faces": camera.recognize_faces,
+            "template_matching": camera.template_matching,
+        }
+    }
+    
+    if is_processing and camera_id in camera_manager.cameras:
+        processor_stats = camera_manager.cameras[camera_id].get_stats()
+        stats["processing_fps"] = processor_stats.get("processing_fps", 0)
+    
+    # Return stream info with RTSP URL for direct frontend streaming
+    return {
+        "camera_id": camera_id,
+        "name": camera.name,
+        "rtsp_url": camera.rtsp_url,
+        "is_processing": is_processing,
+        "processing_fps": stats["processing_fps"],
+        "features": stats["features"]
+    }
 
 @router.get("/{camera_id}/snapshot")
 async def get_camera_snapshot(
     camera_id: int,
     db: AsyncSession = Depends(get_db)
 ):
-    """Get the latest snapshot from a camera"""
+    """Get the latest snapshot from a camera (processed frame with detections)"""
     # Check if camera exists
     camera = await db.get(Camera, camera_id)
     if camera is None:
@@ -124,6 +167,35 @@ async def get_camera_snapshot(
         raise HTTPException(status_code=503, detail="Camera stream not available")
     
     return Response(content=jpeg_frame, media_type="image/jpeg")
+
+@router.get("/{camera_id}/snapshot/base64")
+async def get_camera_snapshot_base64(
+    camera_id: int,
+    db: AsyncSession = Depends(get_db)
+):
+    """Get the latest snapshot from a camera as base64 encoded string"""
+    # Check if camera exists
+    camera = await db.get(Camera, camera_id)
+    if camera is None:
+        raise HTTPException(status_code=404, detail="Camera not found")
+    
+    # Get camera manager
+    camera_manager = await get_camera_manager()
+    
+    # Get latest frame
+    jpeg_frame = await camera_manager.get_jpeg_frame(camera_id)
+    if jpeg_frame is None:
+        raise HTTPException(status_code=503, detail="Camera stream not available")
+    
+    # Convert to base64
+    base64_frame = base64.b64encode(jpeg_frame).decode('utf-8')
+    
+    return {
+        "camera_id": camera_id,
+        "timestamp": datetime.now().isoformat(),
+        "content_type": "image/jpeg",
+        "data": base64_frame
+    }
 
 @router.get("/{camera_id}/status")
 async def get_camera_status(
@@ -189,6 +261,88 @@ async def update_camera_settings(
         raise HTTPException(status_code=400, detail="Failed to update some settings")
     
     return {"message": "Camera settings updated successfully"}
+
+@router.post("/{camera_id}/toggleNotifications")
+async def toggle_notifications(
+    camera_id: int,
+    enable: bool,
+    db: AsyncSession = Depends(get_db)
+):
+    """Toggle notification checking for a camera"""
+    # Check if camera exists
+    camera = await db.get(Camera, camera_id)
+    if camera is None:
+        raise HTTPException(status_code=404, detail="Camera not found")
+    
+    # Get camera manager
+    camera_manager = await get_camera_manager()
+    
+    # Check if camera is active
+    if camera_id not in camera_manager.cameras:
+        raise HTTPException(status_code=400, detail="Camera not active")
+    
+    # Get camera processor
+    processor = camera_manager.cameras[camera_id]
+    
+    # Update notification settings
+    await processor.set_property("check_notification_triggers", enable)
+    
+    return {
+        "camera_id": camera_id,
+        "notifications_enabled": enable
+    }
+
+@router.post("/{camera_id}/process")
+async def toggle_camera_processing(
+    camera_id: int,
+    enable: bool,
+    db: AsyncSession = Depends(get_db)
+):
+    """Toggle processing for a camera"""
+    # Check if camera exists
+    camera = await db.get(Camera, camera_id)
+    if camera is None:
+        raise HTTPException(status_code=404, detail="Camera not found")
+    
+    # Get camera manager
+    camera_manager = await get_camera_manager()
+    
+    # If enabling processing
+    if enable:
+        # Check if camera is already in manager
+        if camera_id in camera_manager.cameras:
+            processor = camera_manager.cameras[camera_id]
+            
+            # If already processing, just return success
+            if processor.processing:
+                return {"camera_id": camera_id, "processing": True}
+            
+            # Otherwise start processing
+            await processor.start_processing()
+        else:
+            # Add camera to manager and start processing
+            await camera_manager.add_camera(camera, start_processing=True)
+    
+    # If disabling processing
+    else:
+        # Check if camera is in manager
+        if camera_id in camera_manager.cameras:
+            processor = camera_manager.cameras[camera_id]
+            
+            # Stop processing
+            await processor.stop_processing()
+        else:
+            # Camera not in manager, nothing to do
+            return {"camera_id": camera_id, "processing": False}
+    
+    # Get updated status
+    is_processing = (camera_id in camera_manager.cameras and 
+                    camera_manager.cameras[camera_id].processing)
+    
+    return {
+        "camera_id": camera_id,
+        "processing": is_processing
+    }
 
 # Background tasks for camera management
 async def add_camera_to_manager(camera_id: int):
@@ -290,7 +444,7 @@ async def test_camera_connection(
     if connection_success:
         try:
             processor = camera_manager.cameras[camera_id]
-            frame_data = processor.get_latest_frame()
+            frame_data = await processor.get_latest_frame()
             
             if frame_data:
                 frame, timestamp = frame_data
@@ -331,7 +485,8 @@ async def test_camera_connection(
                 "detect_people": processor.detect_people,
                 "count_people": processor.count_people,
                 "recognize_faces": processor.recognize_faces,
-                "template_matching": processor.template_matching
+                "template_matching": processor.template_matching,
+                "check_notification_triggers": processor.check_notification_triggers
             }
         }
     

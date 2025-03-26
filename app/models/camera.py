@@ -31,6 +31,7 @@ class Camera(Base):
     # Relationships
     templates = relationship("Template", back_populates="camera", cascade="all, delete-orphan")
     events = relationship("Event", back_populates="camera", cascade="all, delete-orphan")
+    triggers = relationship("NotificationTrigger", back_populates="camera")
     
     # Metadata
     created_at = Column(DateTime(timezone=True), server_default=func.now())
@@ -77,3 +78,15 @@ class CameraResponse(CameraBase):
     
     class Config:
         orm_mode = True
+
+class CameraStreamInfo(BaseModel):
+    """Camera stream information schema"""
+    camera_id: int
+    name: str
+    rtsp_url: str
+    is_processing: bool
+    processing_fps: float
+    features: dict
+    
+    class Config:
+        orm_mode = False

@@ -1,4 +1,132 @@
-height} at {fps}fps")
+import cv2
+import numpy as np
+import os
+import logging
+import asyncio
+import time
+from typing import Dict, List, Any, Optional, Tuple, Callable
+from datetime import datetime
+import uuid
+from sqlalchemy import select, insert
+from concurrent.futures import ThreadPoolExecutor
+
+from app.config import settings
+from app.utils.frame_utils import (
+    draw_bounding_boxes, draw_line, draw_text_overlay,
+    overlay_timestamp, save_frame
+)
+from app.utils.event_emitter import EventEmitter
+
+logger = logging.getLogger(__name__)
+
+class StreamProcessor:
+    """
+    Processes RTSP camera streams with AI components for detection, 
+    recognition, and counting.
+    """
+    def __init__(
+        self, 
+        camera_id: int, 
+        name: str,
+        rtsp_url: str,
+        processing_fps: int = 5,
+        streaming_fps: int = 30,
+        detect_people: bool = True,
+        count_people: bool = True,
+        recognize_faces: bool = False,
+        template_matching: bool = False
+    ):
+        self.camera_id = camera_id
+        self.name = name
+        self.rtsp_url = rtsp_url
+        self.processing_fps = processing_fps
+        self.streaming_fps = streaming_fps
+        
+        # Feature flags
+        self.detect_people = detect_people
+        self.count_people = count_people
+        self.recognize_faces = recognize_faces
+        self.template_matching = template_matching
+        
+        # AI components
+        self.object_detector = None
+        self.face_recognizer = None
+        self.template_matcher = None
+        self.people_counter = None
+        
+        # Video settings
+        self.record_video = False
+        self.video_writer = None
+        
+        # UI settings
+        self.draw_detections = True
+        self.draw_count_line = True
+        self.draw_timestamps = True
+        
+        # Frame buffers
+        self.raw_frames = []  # List of (frame, timestamp) tuples
+        self.processed_frames = []  # List of (frame, timestamp) tuples
+        self.max_buffer_size = 30
+        self._frame_lock = asyncio.Lock()
+        
+        # State variables
+        self.connected = False
+        self.running = False
+        self.processing = False
+        self.paused = False
+        
+        # Performance metrics
+        self.fps = 0
+        self.frames_captured = 0
+        self.frames_processed = 0
+        self.processing_fps_actual = 0
+        self.last_frame_time = 0
+        self.last_processed_time = 0
+        self.processing_start_time = 0
+        
+        # OpenCV capture object
+        self.capture = None
+        
+        # Latest detection results
+        self.detection_results = {}
+        self.current_occupancy = 0
+        
+        # Event emitter for notifications
+        self.events = EventEmitter()
+        
+        # Notification settings
+        self.check_notification_triggers = True  # Enable notification checking
+    
+    async def connect(self) -> bool:
+        """
+        Connect to the RTSP stream
+        
+        Returns:
+            Success flag
+        """
+        try:
+            # Disconnect first if already connected
+            if self.connected:
+                await self.disconnect()
+            
+            # Create OpenCV capture
+            self.capture = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
+            
+            # Check if connection was successful
+            if not self.capture.isOpened():
+                logger.error(f"Failed to open RTSP stream: {self.rtsp_url}")
+                return False
+            
+            # Get video properties
+            width = int(self.capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(self.capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            fps = self.capture.get(cv2.CAP_PROP_FPS)
+            
+            # Use default FPS if not detected
+            if fps <= 0:
+                fps = 30.0
+            
+            logger.info(f"Connected to camera {self.camera_id}: {width}x{height} at {fps}fps")
             
             # Setup video recording if enabled
             if self.record_video:
@@ -306,7 +434,7 @@ height} at {fps}fps")
                     # Get notification service
                     notification_service = await get_notification_service()
                     
-                    # Check triggers in a background task
+                    # Check triggers in a background task - passing the frame for snapshots
                     asyncio.create_task(notification_service.check_all_triggers(
                         self.camera_id, results, frame.copy()
                     ))
