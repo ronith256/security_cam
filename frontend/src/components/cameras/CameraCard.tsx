@@ -4,7 +4,7 @@ import { Link } from 'react-router-dom';
 import { Camera, Play, Pause, Eye, Edit, Trash2 } from 'lucide-react';
 import Card from '../common/Card';
 import Button from '../common/Button';
-import RTSPStreamViewer from './RTSPStreamViewer';
+import HLSStreamViewer from './HLSStreamViewer';
 import { Camera as CameraType } from '../../types/camera';
 import { updateCamera, deleteCamera } from '../../api/cameras';
 import { useApi } from '../../hooks/useApi';
@@ -69,13 +69,12 @@ const CameraCard: React.FC<CameraCardProps> = ({
         <div className="mb-4 bg-gray-100 h-40 rounded-md flex items-center justify-center relative">
           {camera.enabled && isStreamVisible ? (
             <div className="w-full h-full">
-              <RTSPStreamViewer
+              <HLSStreamViewer
                 cameraId={camera.id}
                 rtspUrl={camera.rtsp_url}
                 height="h-40"
                 onReady={() => handleConnectionChange(true)}
                 onError={() => handleConnectionChange(false)}
-                fallbackToWebRTC={true}
               />
               <div className="absolute top-2 right-2">
                 <Button 

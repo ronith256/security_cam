@@ -28,3 +28,6 @@ dist-ssr
 *.pt
 __pycache__
 cctv_monitoring.db
+*.m3u8
+*.ts
+*.access

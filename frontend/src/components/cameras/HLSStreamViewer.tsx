@@ -1,80 +1,69 @@
-// src/components/cameras/RTSPStreamViewer.tsx
 import React, { useState, useEffect, useRef } from 'react';
 import ReactPlayer from 'react-player';
 import { Loader2, AlertTriangle } from 'lucide-react';
 import Button from '../common/Button';
-import { wsBaseUrl } from '../../api';
+import { apiBaseUrl } from '../../api';
+import axios from 'axios';
 
-interface RTSPStreamViewerProps {
+interface HLSStreamViewerProps {
   cameraId: number;
   rtspUrl?: string;
   height?: string;
   width?: string;
   onError?: (error: Error) => void;
   onReady?: () => void;
-  fallbackToWebRTC?: boolean;
 }
 
-const RTSPStreamViewer: React.FC<RTSPStreamViewerProps> = ({
+const HLSStreamViewer: React.FC<HLSStreamViewerProps> = ({
   cameraId,
   rtspUrl,
   height = 'h-72',
   width = 'w-full',
   onError,
-  onReady,
-  fallbackToWebRTC = true
+  onReady
 }) => {
-  const [streamUrl, setStreamUrl] = useState<string | null>(rtspUrl || null);
+  const [streamUrl, setStreamUrl] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<Error | null>(null);
-  const [isUsingWebRTC, setIsUsingWebRTC] = useState(false);
+  const [sessionId, setSessionId] = useState<string | null>(null);
   const playerRef = useRef<ReactPlayer | null>(null);
-  const webRTCSocketRef = useRef<WebSocket | null>(null);
+  const streamCheckInterval = useRef<NodeJS.Timeout | null>(null);
 
-  // Function to set up WebRTC streaming as fallback
-  const setupWebRTCStream = () => {
+  // Function to start HLS stream
+  const startHLSStream = async () => {
     setIsLoading(true);
-    setIsUsingWebRTC(true);
+    setError(null);
     
-    // Close any existing WebSocket
-    if (webRTCSocketRef.current) {
-      webRTCSocketRef.current.close();
-    }
-    
-    // Create WebSocket connection to our WebRTC server
-    const ws = new WebSocket(`${wsBaseUrl}/webrtc/stream/${cameraId}`);
-    webRTCSocketRef.current = ws;
-    
-    // Set up event handlers
-    ws.onopen = () => {
-      console.log(`WebRTC WebSocket opened for camera ${cameraId}`);
-    };
-    
-    ws.onmessage = (event) => {
-      try {
-        const message = JSON.parse(event.data);
+    try {
+      // Request a new HLS stream for this camera
+      const response = await axios.post(`${apiBaseUrl}/hls/start/${cameraId}`);
+      
+      if (response.data && response.data.url) {
+        console.log(`Received HLS stream URL: ${response.data.url}`);
+        // Actual URL that will be used by ReactPlayer
+        console.log(`Full stream URL to be used: ${response.data.url}`);
+        setStreamUrl(response.data.url);
+        setSessionId(response.data.session_id);
+        setIsLoading(false);
+        if (onReady) onReady();
         
-        if (message.type === 'webrtc_url') {
-          // We received a WebRTC stream URL from our backend
-          setStreamUrl(message.url);
-          setIsLoading(false);
-          if (onReady) onReady();
-        } else if (message.type === 'error') {
-          handleError(new Error(message.error));
+        // Start a periodic keep-alive request to prevent stream termination
+        if (streamCheckInterval.current) {
+          clearInterval(streamCheckInterval.current);
         }
-      } catch (err) {
-        console.error('Error processing WebSocket message:', err);
+        
+        streamCheckInterval.current = setInterval(() => {
+          axios.post(`${apiBaseUrl}/hls/keepalive/${response.data.session_id}`)
+            .catch(error => console.error('Error sending keepalive:', error));
+        }, 30000); // Every 30 seconds
+      } else {
+        handleError(new Error('Failed to get stream URL'));
       }
-    };
-    
-    ws.onerror = (event) => {
-      console.error('WebSocket error:', event);
-      handleError(new Error('Failed to connect to WebRTC stream'));
-    };
-    
-    ws.onclose = () => {
-      console.log('WebRTC WebSocket closed');
-    };
+    } catch (err) {
+      const errorMessage = err instanceof Error ? err.message : 'Failed to start stream';
+      console.error('Stream error:', err);
+      handleError(new Error(errorMessage));
+    }
   };
 
   // Function to handle errors
@@ -86,12 +75,6 @@ const RTSPStreamViewer: React.FC<RTSPStreamViewerProps> = ({
     if (onError) {
       onError(err);
     }
-    
-    // If direct RTSP failed and fallback is enabled, try WebRTC
-    if (!isUsingWebRTC && fallbackToWebRTC) {
-      console.log('Falling back to WebRTC stream');
-      setupWebRTCStream();
-    }
   };
 
   // Function to handle player ready
@@ -100,24 +83,24 @@ const RTSPStreamViewer: React.FC<RTSPStreamViewerProps> = ({
     if (onReady) onReady();
   };
 
-  // Set up the stream when component mounts or rtspUrl changes
+  // Set up the stream when component mounts
   useEffect(() => {
-    // If we have an RTSP URL, use it directly first
-    if (rtspUrl) {
-      setStreamUrl(rtspUrl);
-      setIsUsingWebRTC(false);
-    } else {
-      // Otherwise use WebRTC
-      setupWebRTCStream();
-    }
+    startHLSStream();
     
     // Cleanup function
     return () => {
-      if (webRTCSocketRef.current) {
-        webRTCSocketRef.current.close();
+      // Stop the keepalive interval
+      if (streamCheckInterval.current) {
+        clearInterval(streamCheckInterval.current);
+      }
+      
+      // Terminate the stream session if we have one
+      if (sessionId) {
+        axios.delete(`${apiBaseUrl}/hls/stop/${sessionId}`)
+          .catch(error => console.error('Error stopping stream:', error));
       }
     };
-  }, [rtspUrl, cameraId]);
+  }, [cameraId]); // Only depend on cameraId
 
   // If we're still loading and don't have a stream URL yet
   if (isLoading && !streamUrl) {
@@ -132,14 +115,18 @@ const RTSPStreamViewer: React.FC<RTSPStreamViewerProps> = ({
   }
 
   // If we have an error
-  if (error && !isUsingWebRTC) {
+  if (error) {
     return (
       <div className={`${width} ${height} bg-red-50 rounded-md flex flex-col items-center justify-center p-4`}>
         <AlertTriangle size={40} className="text-red-500 mb-2" />
         <p className="text-red-700 text-center mb-4">{error.message}</p>
         <Button 
           variant="primary" 
-          onClick={() => window.location.reload()}
+          onClick={() => {
+            setError(null);
+            setIsLoading(true);
+            startHLSStream();
+          }}
         >
           Retry
         </Button>
@@ -158,17 +145,20 @@ const RTSPStreamViewer: React.FC<RTSPStreamViewerProps> = ({
           playing
           controls={false}
           onReady={handleReady}
-          onError={handleError}
+          onError={(e) => {
+            console.error('ReactPlayer error:', e);
+            handleError(new Error('Failed to play stream'));
+          }}
           onBuffer={() => setIsLoading(true)}
           onBufferEnd={() => setIsLoading(false)}
           config={{
             file: {
-              // For WebRTC streams
-              forceHLS: !isUsingWebRTC && streamUrl.includes('.m3u8'),
+              forceHLS: true, // Force HLS streaming
               forceVideo: true,
               attributes: {
                 style: { objectFit: 'contain' },
                 playsInline: true,
+                crossorigin: "anonymous"
               }
             }
           }}
@@ -184,14 +174,12 @@ const RTSPStreamViewer: React.FC<RTSPStreamViewerProps> = ({
         </div>
       )}
       
-      {/* Optional indicator for WebRTC fallback */}
-      {isUsingWebRTC && (
-        <div className="absolute top-2 right-2 bg-blue-600 text-white text-xs py-1 px-2 rounded">
-          WebRTC
-        </div>
-      )}
+      {/* Indicator for HLS streaming */}
+      <div className="absolute top-2 right-2 bg-blue-600 text-white text-xs py-1 px-2 rounded">
+        HLS Stream
+      </div>
     </div>
   );
 };
 
-export default RTSPStreamViewer;
+export default HLSStreamViewer; 

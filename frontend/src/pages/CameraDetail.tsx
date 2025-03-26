@@ -5,7 +5,7 @@ import { Edit, ArrowLeft, Image, Activity } from 'lucide-react';
 import PageHeader from '../components/common/PageHeader';
 import Button from '../components/common/Button';
 import Card from '../components/common/Card';
-import RTSPStreamViewer from '../components/cameras/RTSPStreamViewer';
+import HLSStreamViewer from '../components/cameras/HLSStreamViewer';
 import CameraStats from '../components/cameras/CameraStats';
 import FaceDetections from '../components/faces/FaceDetections';
 import TemplateList from '../components/templates/TemplateList';
@@ -205,20 +205,19 @@ const CameraDetail: React.FC = () => {
                 variant="secondary"
                 size="sm"
                 icon={<Activity size={16} />}
-                onClick={() => showToast('Direct RTSP streaming from camera', 'info')}
+                onClick={() => showToast('HLS streaming from camera', 'info')}
               >
-                Direct RTSP
+                HLS Stream
               </Button>
             }
           >
             <div className="flex-grow">
-              <RTSPStreamViewer 
+              <HLSStreamViewer 
                 cameraId={cameraId}
                 rtspUrl={camera.rtsp_url}
                 height="h-96"
                 onReady={() => handleStreamConnection(true)}
                 onError={() => handleStreamConnection(false)}
-                fallbackToWebRTC={true}
               />
             </div>
           </Card>
