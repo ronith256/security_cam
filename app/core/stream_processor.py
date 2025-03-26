@@ -1,110 +1,4 @@
-import cv2
-import numpy as np
-import asyncio
-import logging
-import time
-from typing import Dict, List, Optional, Tuple, Any, Callable
-from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor
-
-from app.utils.frame_utils import resize_frame, draw_bounding_boxes, draw_line, overlay_timestamp
-from app.utils.event_emitter import EventEmitter
-from app.models.event import EventType
-from app.config import settings
-
-logger = logging.getLogger(__name__)
-
-class StreamProcessor:
-    """
-    Handles video stream processing pipeline, frame buffers, and task scheduling.
-    Acts as a coordinator between camera input and AI processing components.
-    """
-    def __init__(self, camera_id: int, name: str, rtsp_url: str, **kwargs):
-        self.camera_id = camera_id
-        self.name = name
-        self.rtsp_url = rtsp_url
-        
-        # Processing settings
-        self.processing_fps = kwargs.get("processing_fps", settings.DEFAULT_FPS)
-        self.streaming_fps = kwargs.get("streaming_fps", 30)
-        self.max_buffer_size = kwargs.get("buffer_size", 120)  # ~4 seconds at 30fps
-        
-        # Feature flags
-        self.detect_people = kwargs.get("detect_people", False)
-        self.count_people = kwargs.get("count_people", False)
-        self.recognize_faces = kwargs.get("recognize_faces", False)
-        self.template_matching = kwargs.get("template_matching", False)
-        self.record_video = kwargs.get("record_video", False)
-        
-        # Visualization flags
-        self.draw_detections = kwargs.get("draw_detections", True)
-        self.draw_count_line = kwargs.get("draw_count_line", True)
-        self.draw_timestamps = kwargs.get("draw_timestamps", True)
-        
-        # State flags
-        self.connected = False
-        self.processing = False
-        self.running = False
-        self.paused = False
-        
-        # Stream capture components
-        self.capture = None
-        self.video_writer = None
-        
-        # Frame buffers (thread-safe)
-        self.raw_frames = []  # (frame, timestamp) tuples
-        self.processed_frames = []  # (frame, timestamp) tuples
-        
-        # Stats
-        self.frames_processed = 0
-        self.frames_captured = 0
-        self.fps = 0.0
-        self.processing_fps_actual = 0.0
-        self.last_frame_time = 0
-        self.last_processed_time = 0
-        self.processing_start_time = 0
-        
-        # Detection results
-        self.detection_results = {}
-        self.current_occupancy = 0
-        
-        # AI processors will be set by camera manager
-        self.object_detector = None
-        self.face_recognizer = None
-        self.template_matcher = None
-        self.people_counter = None
-        
-        # Event emitter for async notifications
-        self.events = EventEmitter()
-        
-        # Thread pool for CPU-bound operations
-        self.executor = ThreadPoolExecutor(max_workers=2)
-        
-        # Locks for thread safety
-        self._frame_lock = asyncio.Lock()
-    
-    async def connect(self) -> bool:
-        """Connect to the RTSP stream"""
-        try:
-            logger.info(f"Connecting to camera {self.camera_id} at {self.rtsp_url}")
-            
-            # Initialize video capture
-            self.capture = cv2.VideoCapture(self.rtsp_url)
-            
-            # Check if connection successful
-            if not self.capture.isOpened():
-                logger.error(f"Failed to open RTSP stream: {self.rtsp_url}")
-                return False
-            
-            # Set capture properties
-            self.capture.set(cv2.CAP_PROP_BUFFERSIZE, 2)  # Minimize buffer delay
-            
-            # Get stream info
-            width = int(self.capture.get(cv2.CAP_PROP_FRAME_WIDTH))
-            height = int(self.capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            fps = self.capture.get(cv2.CAP_PROP_FPS)
-            
-            logger.info(f"Connected to camera {self.camera_id}: {width}x{height} at {fps}fps")
+height} at {fps}fps")
             
             # Setup video recording if enabled
             if self.record_video:
@@ -194,8 +88,9 @@ class StreamProcessor:
         logger.info(f"Stopped frame processing for camera {self.camera_id}")
     
     async def _capture_frames(self):
-        """Continuously capture frames from the RTSP stream"""
-        frame_interval = 1.0 / self.streaming_fps
+        """Continuously capture frames from the RTSP stream for AI processing"""
+        # Only capture at the rate needed for processing, not streaming
+        frame_interval = 1.0 / self.processing_fps
         last_capture_time = 0
         frames_count = 0
         start_time = time.time()
@@ -328,7 +223,7 @@ class StreamProcessor:
                 await asyncio.sleep(0.1)
     
     async def _process_frame_pipeline(self, frame: np.ndarray) -> Tuple[np.ndarray, Dict[str, Any]]:
-        """Process a frame through all enabled AI components"""
+        """Process a frame through all enabled AI components and check for triggers"""
         results = {}
         processed_frame = frame.copy()
         
@@ -401,6 +296,23 @@ class StreamProcessor:
             if self.draw_timestamps:
                 processed_frame = overlay_timestamp(processed_frame)
             
+            # Check notification triggers for the results
+            # This needs to be done in a non-blocking way to avoid slowing down the pipeline
+            if self.check_notification_triggers:
+                try:
+                    # Import here to avoid circular imports
+                    from app.services.notification_service import get_notification_service
+                    
+                    # Get notification service
+                    notification_service = await get_notification_service()
+                    
+                    # Check triggers in a background task
+                    asyncio.create_task(notification_service.check_all_triggers(
+                        self.camera_id, results, frame.copy()
+                    ))
+                except Exception as e:
+                    logger.exception(f"Error checking notification triggers: {str(e)}")
+            
             return processed_frame, results
             
         except Exception as e:
@@ -424,7 +336,12 @@ class StreamProcessor:
         return None
     
     async def get_latest_frame_jpeg(self, quality: int = 90) -> Optional[bytes]:
-        """Get the latest frame as JPEG bytes"""
+        """
+        Get the latest frame as JPEG bytes
+        
+        Note: This is only used for snapshot functionality and debugging,
+        not for streaming to frontend.
+        """
         frame_data = await self.get_latest_frame()
         if not frame_data:
             return None
@@ -480,7 +397,6 @@ class StreamProcessor:
             "camera_id": self.camera_id,
             "connected": self.connected,
             "processing": self.processing,
-            "streaming_fps": self.fps,
             "processing_fps": self.processing_fps_actual,
             "frames_captured": self.frames_captured,
             "frames_processed": self.frames_processed,
@@ -491,7 +407,8 @@ class StreamProcessor:
                 "count_people": self.count_people,
                 "recognize_faces": self.recognize_faces,
                 "template_matching": self.template_matching,
-                "record_video": self.record_video
+                "record_video": self.record_video,
+                "notification_triggers": self.check_notification_triggers
             }
         }
     
