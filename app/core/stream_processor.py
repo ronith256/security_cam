@@ -222,6 +222,9 @@ class StreamProcessor:
         last_capture_time = 0
         frames_count = 0
         start_time = time.time()
+        connection_errors = 0
+        
+        logger.info(f"Starting frame capture loop for camera {self.camera_id} ({self.name}) at {self.processing_fps} FPS")
         
         while self.running and self.connected:
             try:
@@ -234,20 +237,46 @@ class StreamProcessor:
                 
                 # Check connection status periodically
                 if frames_count % 30 == 0:
-                    if not self.capture.isOpened():
-                        logger.warning(f"Camera {self.camera_id} connection lost, attempting to reconnect")
+                    if not self.capture or not self.capture.isOpened():
+                        logger.warning(f"Camera {self.camera_id} connection lost or not opened, attempting to reconnect")
+                        connection_errors += 1
+                        
+                        if connection_errors > 5:
+                            logger.error(f"Multiple reconnection failures for camera {self.camera_id}. Check RTSP URL: {self.rtsp_url}")
+                            
                         await asyncio.sleep(1)
                         # Attempt to reconnect
                         if not await self.connect():
                             await asyncio.sleep(5)  # Wait before retrying
                             continue
+                        connection_errors = 0
                 
+                # Explicitly check if capture is None
+                if self.capture is None:
+                    logger.error(f"Capture object is None for camera {self.camera_id}")
+                    await asyncio.sleep(1)
+                    continue
+                    
                 # Capture frame
                 ret, frame = self.capture.read()
                 if not ret:
                     logger.warning(f"Failed to read frame from camera {self.camera_id}")
+                    connection_errors += 1
+                    
+                    if connection_errors > 10:
+                        logger.error(f"Too many frame read failures for camera {self.camera_id}. Attempting reconnect.")
+                        await self.connect()
+                        connection_errors = 0
+                    
                     await asyncio.sleep(0.1)  # Short wait before retry
                     continue
+                
+                # Reset connection errors counter on successful frame read
+                connection_errors = 0
+                
+                # Log occasionally about successful frame grabs
+                if frames_count % 100 == 0:
+                    logger.debug(f"Successfully grabbed frame #{frames_count} from camera {self.camera_id}")
                 
                 # Add frame to buffer
                 async with self._frame_lock:
@@ -267,6 +296,7 @@ class StreamProcessor:
                 # Calculate FPS every second
                 if current_time - start_time >= 1.0:
                     self.fps = frames_count / (current_time - start_time)
+                    logger.debug(f"Camera {self.camera_id} capture FPS: {self.fps:.2f}")
                     frames_count = 0
                     start_time = current_time
                 
@@ -283,7 +313,10 @@ class StreamProcessor:
         process_interval = 1.0 / self.processing_fps
         last_process_time = 0
         frames_processed_count = 0
+        processing_errors = 0
         start_time = time.time()
+        
+        logger.info(f"Starting frame processing loop for camera {self.camera_id} ({self.name}) at {self.processing_fps} FPS")
         
         while self.processing and self.connected:
             try:
@@ -302,13 +335,29 @@ class StreamProcessor:
                 # Get latest frame from buffer
                 frame_data = await self._get_latest_frame()
                 if not frame_data:
-                    await asyncio.sleep(0.01)
+                    if processing_errors % 10 == 0:  # Only log every 10 errors to avoid spam
+                        logger.warning(f"No frames available for processing from camera {self.camera_id}")
+                    processing_errors += 1
+                    await asyncio.sleep(0.1)
                     continue
+                
+                # Reset error counter on successful frame retrieval
+                processing_errors = 0
                 
                 frame, timestamp = frame_data
                 
+                # Log frame shape to debug if frames are valid
+                if frames_processed_count == 0:
+                    logger.info(f"Processing first frame from camera {self.camera_id}, shape: {frame.shape}")
+                
                 # Process frame through AI pipeline
                 processed_frame, results = await self._process_frame_pipeline(frame)
+                
+                # Log the results occasionally
+                if frames_processed_count % 50 == 0:
+                    people_count = len(results.get("people", []))
+                    faces_count = len(results.get("faces", []))
+                    logger.debug(f"Camera {self.camera_id} frame #{frames_processed_count} - detected: {people_count} people, {faces_count} faces")
                 
                 # Update processed frame buffer
                 async with self._frame_lock:
@@ -332,6 +381,7 @@ class StreamProcessor:
                 # Calculate processing FPS every second
                 if current_time - start_time >= 1.0:
                     self.processing_fps_actual = frames_processed_count / (current_time - start_time)
+                    logger.debug(f"Camera {self.camera_id} processing FPS: {self.processing_fps_actual:.2f}")
                     frames_processed_count = 0
                     start_time = current_time
                 
@@ -348,19 +398,33 @@ class StreamProcessor:
                 
             except Exception as e:
                 logger.exception(f"Error processing frame for camera {self.camera_id}: {str(e)}")
+                processing_errors += 1
                 await asyncio.sleep(0.1)
     
     async def _process_frame_pipeline(self, frame: np.ndarray) -> Tuple[np.ndarray, Dict[str, Any]]:
         """Process a frame through all enabled AI components and check for triggers"""
         results = {}
         processed_frame = frame.copy()
+        processing_start = time.time()
         
         try:
+            # Log the start of processing
+            logger.debug(f"Processing frame for camera {self.camera_id}", 
+                        extra={"camera_id": self.camera_id})
+            
             # Run object detection first if enabled
             if self.detect_people and self.object_detector:
+                detection_start = time.time()
+                
                 # Detect people
                 people = await self.object_detector.detect_people(frame)
                 results["people"] = people
+                
+                detection_time = time.time() - detection_start
+                logger.info(
+                    f"Camera {self.camera_id}: Detected {len(people)} people in {detection_time:.3f}s",
+                    extra={"camera_id": self.camera_id, "detection": True, "people_count": len(people)}
+                )
                 
                 # Draw bounding boxes if enabled
                 if self.draw_detections:
@@ -370,14 +434,24 @@ class StreamProcessor:
                 
                 # Update people counter
                 if self.count_people and self.people_counter and people:
+                    count_start = time.time()
                     entry_count, exit_count, current_count = await self.people_counter.process_frame(
                         frame, people
                     )
+                    count_time = time.time() - count_start
+                    
                     results["occupancy"] = {
                         "entries": entry_count,
                         "exits": exit_count,
                         "current": current_count
                     }
+                    
+                    logger.info(
+                        f"Camera {self.camera_id}: Occupancy count - Current: {current_count}, "
+                        f"Entries: {entry_count}, Exits: {exit_count} in {count_time:.3f}s",
+                        extra={"camera_id": self.camera_id, "people_count": True, 
+                            "current_count": current_count, "entries": entry_count, "exits": exit_count}
+                    )
                     
                     # Draw counting line if enabled
                     if self.draw_count_line:
@@ -400,8 +474,21 @@ class StreamProcessor:
             
             # Face recognition
             if self.recognize_faces and self.face_recognizer:
+                face_start = time.time()
                 faces = await self.face_recognizer.recognize_faces(frame, self.camera_id)
                 results["faces"] = faces
+                face_time = time.time() - face_start
+                
+                recognized_faces = [f for f in faces if f.get("person_id") is not None]
+                unrecognized_faces = [f for f in faces if f.get("person_id") is None]
+                
+                logger.info(
+                    f"Camera {self.camera_id}: Detected {len(faces)} faces "
+                    f"({len(recognized_faces)} recognized, {len(unrecognized_faces)} unknown) "
+                    f"in {face_time:.3f}s",
+                    extra={"camera_id": self.camera_id, "face": True, 
+                        "total_faces": len(faces), "recognized_faces": len(recognized_faces)}
+                )
                 
                 # Draw face bounding boxes
                 if self.draw_detections and faces:
@@ -411,8 +498,15 @@ class StreamProcessor:
             
             # Template matching
             if self.template_matching and self.template_matcher:
+                template_start = time.time()
                 templates = await self.template_matcher.match_templates(frame)
                 results["templates"] = templates
+                template_time = time.time() - template_start
+                
+                logger.info(
+                    f"Camera {self.camera_id}: Matched {len(templates)} templates in {template_time:.3f}s",
+                    extra={"camera_id": self.camera_id, "template": True, "matches": len(templates)}
+                )
                 
                 # Draw template matches
                 if self.draw_detections and templates:
@@ -431,6 +525,8 @@ class StreamProcessor:
                     # Import here to avoid circular imports
                     from app.services.notification_service import get_notification_service
                     
+                    notification_start = time.time()
+                    
                     # Get notification service
                     notification_service = await get_notification_service()
                     
@@ -438,13 +534,33 @@ class StreamProcessor:
                     asyncio.create_task(notification_service.check_all_triggers(
                         self.camera_id, results, frame.copy()
                     ))
+                    
+                    logger.debug(
+                        f"Camera {self.camera_id}: Checking notification triggers",
+                        extra={"camera_id": self.camera_id, "notification": True}
+                    )
                 except Exception as e:
-                    logger.exception(f"Error checking notification triggers: {str(e)}")
+                    logger.exception(
+                        f"Error checking notification triggers: {str(e)}",
+                        extra={"camera_id": self.camera_id, "notification": True, "error": True}
+                    )
+            
+            # Log total processing time
+            total_time = time.time() - processing_start
+            logger.debug(
+                f"Camera {self.camera_id}: Frame processing completed in {total_time:.3f}s",
+                extra={"camera_id": self.camera_id, "processing_time": total_time}
+            )
             
             return processed_frame, results
             
         except Exception as e:
-            logger.exception(f"Error in processing pipeline for camera {self.camera_id}: {str(e)}")
+            total_time = time.time() - processing_start
+            logger.exception(
+                f"Error in processing pipeline for camera {self.camera_id}: {str(e)} "
+                f"(after {total_time:.3f}s)",
+                extra={"camera_id": self.camera_id, "error": True, "processing_time": total_time}
+            )
             return frame, {}
     
     async def _get_latest_frame(self) -> Optional[Tuple[np.ndarray, float]]:
