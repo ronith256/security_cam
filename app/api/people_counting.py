@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, and_, desc
 from typing import List, Optional, Dict, Any
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import logging
 
 from app.database import get_db
@@ -106,11 +106,25 @@ async def get_occupancy_history(
     if camera is None:
         raise HTTPException(status_code=404, detail="Camera not found")
     
-    # Set default date range if not provided (last 24 hours)
+    # Set default date range if not provided (last 24 hours, use UTC)
     if end_date is None:
-        end_date = datetime.now()
+        end_date = datetime.now(timezone.utc)
     if start_date is None:
-        start_date = end_date - timedelta(hours=24)
+        # Ensure start_date is also aware if end_date is
+        if end_date.tzinfo is not None:
+             start_date = end_date - timedelta(hours=24)
+        else:
+             # Fallback if end_date somehow became naive (shouldn't happen with default)
+             naive_end = datetime.now()
+             start_date = naive_end - timedelta(hours=24)
+             end_date = naive_end # Keep consistency if default failed
+
+    # Ensure query parameters are timezone-aware (assume UTC if naive)
+    # This might be overly cautious if FastAPI handles it, but safer
+    if start_date.tzinfo is None:
+        start_date = start_date.replace(tzinfo=timezone.utc)
+    if end_date.tzinfo is None:
+        end_date = end_date.replace(tzinfo=timezone.utc)
     
     # Get all occupancy events in the time range
     query = select(Event).where(

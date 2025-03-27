@@ -1,6 +1,9 @@
 import os
 from typing import List
 from pydantic_settings import BaseSettings
+from dotenv import load_dotenv
+
+load_dotenv()
 
 class Settings(BaseSettings):
     """Application settings"""
@@ -62,6 +65,9 @@ class Settings(BaseSettings):
     SMTP_USERNAME: str = os.getenv("SMTP_USERNAME", "")
     SMTP_PASSWORD: str = os.getenv("SMTP_PASSWORD", "")
     EMAIL_FROM: str = os.getenv("EMAIL_FROM", "")
+
+    print("SMTP_USERNAME: ", SMTP_USERNAME)
+    print("SMTP_PASSWORD: ", SMTP_PASSWORD)
     
     # Telegram settings for notifications
     TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
