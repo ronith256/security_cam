@@ -3,7 +3,6 @@ import React, { useState, useEffect } from 'react';
 import { Save, X, Play } from 'lucide-react';
 import Button from '../common/Button';
 import { 
-  NotificationTrigger, 
   NotificationTriggerCreate, 
   TriggerConditionType,
   TimeRestrictedTrigger,
@@ -27,7 +26,7 @@ const NotificationTriggerForm: React.FC<NotificationTriggerFormProps> = ({
   isSubmitting
 }) => {
   const { showToast } = useToast();
-  const { errors, validateForm, setErrors } = useNotificationFormValidation();
+  const { errors, validateForm } = useNotificationFormValidation();
 
   // Form data state
   const [formData, setFormData] = useState<NotificationTriggerCreate>({
@@ -265,7 +264,7 @@ const NotificationTriggerForm: React.FC<NotificationTriggerFormProps> = ({
   };
 
   return (
-    <form onSubmit={handleSubmit} className="space-y-6 overflow-y-scroll">
+    <form onSubmit={handleSubmit} className="space-y-6 max-h-[80vh] overflow-y-auto">
       <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
         {/* Basic information */}
         <div className="md:col-span-2">
@@ -376,8 +375,8 @@ const NotificationTriggerForm: React.FC<NotificationTriggerFormProps> = ({
             conditionParams={formData.condition_params}
             onChange={handleConditionParamChange}
             errors={errors}
-            persons={persons}
-            templates={templates}
+            persons={persons || []}
+            templates={templates || []}
             isSubmitting={isSubmitting}
           />
           
