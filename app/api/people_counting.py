@@ -120,7 +120,6 @@ async def get_occupancy_history(
              end_date = naive_end # Keep consistency if default failed
 
     # Ensure query parameters are timezone-aware (assume UTC if naive)
-    # This might be overly cautious if FastAPI handles it, but safer
     if start_date.tzinfo is None:
         start_date = start_date.replace(tzinfo=timezone.utc)
     if end_date.tzinfo is None:
@@ -136,6 +135,11 @@ async def get_occupancy_history(
     
     result = await db.execute(query)
     events = result.scalars().all()
+    
+    # Add timezone info to event timestamps if they're naive
+    for event in events:
+        if event.timestamp.tzinfo is None:
+            event.timestamp = event.timestamp.replace(tzinfo=timezone.utc)
     
     # Parse interval
     interval_value = int(interval[:-1])

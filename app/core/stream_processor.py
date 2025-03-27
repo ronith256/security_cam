@@ -602,23 +602,23 @@ class StreamProcessor:
                     )
                     
                     # Draw counting line if enabled
-                    if self.draw_count_line:
-                        line_pos = self.people_counter.line_position
-                        processed_frame = draw_line(
-                            processed_frame, line_pos, color=(0, 0, 255)
-                        )
+                    # if self.draw_count_line:
+                    #     line_pos = self.people_counter.line_position
+                    #     processed_frame = draw_line(
+                    #         processed_frame, line_pos, color=(0, 0, 255)
+                    #     )
                         
-                        # Draw occupancy info
-                        h, w = processed_frame.shape[:2]
-                        cv2.putText(
-                            processed_frame,
-                            f"Current: {current_count} | In: {entry_count} | Out: {exit_count}",
-                            (10, 30),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.7,
-                            (0, 255, 255),
-                            2
-                        )
+                    #     # Draw occupancy info
+                    #     h, w = processed_frame.shape[:2]
+                    #     cv2.putText(
+                    #         processed_frame,
+                    #         f"Current: {current_count} | In: {entry_count} | Out: {exit_count}",
+                    #         (10, 30),
+                    #         cv2.FONT_HERSHEY_SIMPLEX,
+                    #         0.7,
+                    #         (0, 255, 255),
+                    #         2
+                    #     )
             
             # Face recognition
             if self.recognize_faces and self.face_recognizer:

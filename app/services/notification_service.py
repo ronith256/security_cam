@@ -66,6 +66,9 @@ class NotificationService:
                 time_since_last = (now - trigger.last_triggered).total_seconds()
                 if time_since_last < trigger.cooldown_period:
                     return False
+                
+            if trigger.last_triggered is None:
+                logger.info(f"Trigger {trigger.id} has never been triggered before")
             
             # Check time restrictions
             if trigger.time_restriction != TimeRestrictedTrigger.ALWAYS:

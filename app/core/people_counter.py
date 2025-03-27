@@ -40,6 +40,9 @@ class PeopleCounter:
         
         # Tracker
         self.tracker = cv2.TrackerKCF_create
+
+        # Flag for initial frame processing
+        self.initial_phase_complete = False
     
     async def process_frame(
         self, 
@@ -73,10 +76,13 @@ class PeopleCounter:
             centroids.append((cx, cy))
             rects.append((x1, y1, x2 - x1, y2 - y1))
         
+        # Determine if this is the first frame with detections
+        is_initial_frame_with_detections = not self.initial_phase_complete and len(detections) > 0
+
         # If we have no objects, register all centroids
         if len(self.objects) == 0:
             for centroid in centroids:
-                self._register_object(centroid)
+                self._register_object(centroid, is_initial=is_initial_frame_with_detections)
         
         # Otherwise, try to match current centroids to existing objects
         else:
@@ -129,8 +135,13 @@ class PeopleCounter:
             
             # Register new objects
             for col in unused_cols:
-                self._register_object(centroids[col])
-        
+                self._register_object(centroids[col], is_initial=is_initial_frame_with_detections)
+
+        # Mark initial phase as complete after the first frame with detections
+        if is_initial_frame_with_detections:
+            self.initial_phase_complete = True
+            logger.info(f"Initial phase complete. Initial entry count: {self.entry_count}")
+
         # Update current count
         self.current_count = max(0, self.entry_count - self.exit_count)
         
@@ -141,12 +152,27 @@ class PeopleCounter:
         
         return self.entry_count, self.exit_count, self.current_count
     
-    def _register_object(self, centroid: Tuple[int, int]):
+    def _register_object(self, centroid: Tuple[int, int], is_initial: bool = False):
         """Register a new object with the next available ID"""
-        self.objects[self.next_object_id] = centroid
-        self.disappeared[self.next_object_id] = 0
+        new_object_id = self.next_object_id
+        self.objects[new_object_id] = centroid
+        self.disappeared[new_object_id] = 0
         self.next_object_id += 1
-    
+        
+        if is_initial:
+            self.entry_count += 1
+            # Determine initial position relative to the line
+            _, cy = centroid
+            if self.line_y is not None: # Ensure line_y is calculated
+                initial_direction = "above" if cy < self.line_y else "below"
+                # Set crossed state to prevent immediate re-counting and prepare for exit
+                self.crossed[new_object_id] = {"direction": initial_direction, "counted": True}
+                logger.debug(f"Registered initial object {new_object_id} at {centroid}. Entry count: {self.entry_count}. Initial direction: {initial_direction}")
+            else:
+                 # Should ideally not happen if process_frame calculates line_y first
+                 logger.warning(f"Registered initial object {new_object_id} before line_y was set.")
+                 self.crossed[new_object_id] = {"direction": None, "counted": True}
+
     def _deregister_object(self, object_id: int):
         """Deregister an object that has disappeared"""
         del self.objects[object_id]
