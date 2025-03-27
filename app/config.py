@@ -36,7 +36,7 @@ class Settings(BaseSettings):
     
     # AI models settings
     MODELS_DIR: str = os.getenv("MODELS_DIR", "models")
-    DETECTION_MODEL: str = os.getenv("DETECTION_MODEL", "yolov8n.pt")  # Default to YOLOv8 nano
+    DETECTION_MODEL: str = os.getenv("DETECTION_MODEL", "yolo11n.pt")  # Default to YOLOv8 nano
     FACE_RECOGNITION_MODEL: str = os.getenv("FACE_RECOGNITION_MODEL", "face_recognition_model")
     
     # Video processing settings

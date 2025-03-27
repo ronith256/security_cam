@@ -65,10 +65,8 @@ class NotificationService:
                 now = datetime.now()
                 time_since_last = (now - trigger.last_triggered).total_seconds()
                 if time_since_last < trigger.cooldown_period:
+                    logger.debug(f"Trigger {trigger.id} in cooldown period, last triggered {time_since_last:.2f}s ago")
                     return False
-                
-            if trigger.last_triggered is None:
-                logger.info(f"Trigger {trigger.id} has never been triggered before")
             
             # Check time restrictions
             if trigger.time_restriction != TimeRestrictedTrigger.ALWAYS:
@@ -158,31 +156,41 @@ class NotificationService:
             bool: True if notification was sent, False otherwise
         """
         try:
-            # Evaluate if the trigger should fire
-            should_trigger = await self.evaluate_trigger(trigger, camera_id, event_data, frame)
-            
-            if not should_trigger:
-                return False
-            
-            # Save snapshot if we have a frame
-            snapshot_path = None
-            if frame is not None:
-                # Generate a filename based on the event
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                filename = f"trigger_{trigger.id}_{camera_id}_{timestamp}.jpg"
-                
-                # Save the frame
-                snapshot_path = save_frame(frame, filename, settings.SNAPSHOTS_DIR)
-            
-            # Create notification event record
+            # Re-fetch the trigger to ensure we have the latest state
             async for session in get_db():
+                # Get the latest state of the trigger
+                fresh_trigger = await session.get(NotificationTrigger, trigger.id)
+                
+                if not fresh_trigger:
+                    logger.warning(f"Trigger {trigger.id} no longer exists")
+                    return False
+                
+                # Use the refreshed trigger for evaluation
+                should_trigger = await self.evaluate_trigger(fresh_trigger, camera_id, event_data, frame)
+                
+                if not should_trigger:
+                    return False
+                
+                # Save snapshot if we have a frame
+                snapshot_path = None
+                if frame is not None:
+                    # Generate a filename based on the event
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    filename = f"trigger_{fresh_trigger.id}_{camera_id}_{timestamp}.jpg"
+                    
+                    # Save the frame
+                    snapshot_path = save_frame(frame, filename, settings.SNAPSHOTS_DIR)
+                
                 # Update last triggered time on the trigger
-                trigger.last_triggered = datetime.now()
+                fresh_trigger.last_triggered = datetime.now()
                 await session.commit()
+                await session.refresh(fresh_trigger)
+                
+                logger.info(f"Trigger {fresh_trigger.id} activated, sending notification")
                 
                 # Create notification event
                 notification_event = NotificationEvent(
-                    trigger_id=trigger.id,
+                    trigger_id=fresh_trigger.id,
                     camera_id=camera_id,
                     event_data=event_data,
                     snapshot_path=snapshot_path
@@ -194,13 +202,18 @@ class NotificationService:
                 
                 # Send the notification
                 success, error = await self.send_notification(
-                    trigger, notification_event, frame if snapshot_path else None
+                    fresh_trigger, notification_event, frame if snapshot_path else None
                 )
                 
                 # Update notification status
                 notification_event.sent_successfully = success
                 notification_event.delivery_error = error
                 await session.commit()
+                
+                if success:
+                    logger.info(f"Notification for trigger {fresh_trigger.id} sent successfully")
+                else:
+                    logger.error(f"Failed to send notification for trigger {fresh_trigger.id}: {error}")
                 
                 return success
                 
@@ -438,12 +451,18 @@ class NotificationService:
         """
         try:
             async for session in get_db():
-                # Get all active triggers
+                # Get all active triggers that match the camera or are global
                 query = select(NotificationTrigger).where(
-                    NotificationTrigger.active == True
+                    NotificationTrigger.active == True,
+                    (NotificationTrigger.camera_id == camera_id) | (NotificationTrigger.camera_id == None)
                 )
+                
                 result = await session.execute(query)
                 triggers = result.scalars().all()
+                
+                # Log how many triggers we're checking
+                if triggers:
+                    logger.debug(f"Checking {len(triggers)} active triggers for camera {camera_id}")
                 
                 # Process each trigger
                 for trigger in triggers:

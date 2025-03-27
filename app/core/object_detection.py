@@ -35,7 +35,7 @@ class ObjectDetector:
         try:
             if YOLO_AVAILABLE:
                 # Use YOLOv8 from ultralytics
-                logger.info(f"Loading YOLOv8 model from {self.model_path}")
+                logger.info(f"Loading YOLOv11 model from {self.model_path}")
                 self.model = YOLO(self.model_path)
                 self.initialized = True
             else:
